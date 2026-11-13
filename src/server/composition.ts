@@ -88,6 +88,12 @@ import {
   createKubernetesComputer,
   createKubernetesWorkspace,
 } from '../providers/kubernetes/index.ts';
+import {
+  createRemoteComputer,
+  createRemoteWorkspace,
+  relayAddress,
+  relayToken,
+} from '../providers/remote/index.ts';
 import { createEnvironmentKeyStore } from '../providers/environment/key-store.ts';
 import { createKeychainKeyStore } from '../providers/keychain/key-store.ts';
 import { createFilesystemKeyStore } from '../providers/filesystem/key-store.ts';
@@ -295,7 +301,7 @@ export function modelEnvironment(
 export function createDefaultAdapters(
   env: Record<string, string | undefined> = process.env,
 ): ApplicationAdapters {
-  const runtime = z.enum(['docker', 'kubernetes']).parse(env.NOD_RUNTIME ?? 'docker');
+  const runtime = z.enum(['docker', 'kubernetes', 'remote']).parse(env.NOD_RUNTIME ?? 'docker');
   const namespace = env.NOD_KUBERNETES_NAMESPACE || 'nod';
   const defaultFeedbackUrl = 'https://internal.users.n8n.cloud/webhook/nod/feedback';
   const feedbackUrl = env.NOD_FEEDBACK_URL ?? defaultFeedbackUrl;
@@ -482,7 +488,13 @@ export function createDefaultAdapters(
     computer:
       runtime === 'kubernetes'
         ? createKubernetesComputer({ dataRoot, namespace })
-        : createContainerBrowserComputer({ dataRoot, container: env.BROWSER_CONTAINER }),
+        : runtime === 'remote'
+          ? createRemoteComputer({
+              dataRoot,
+              address: relayAddress(env.NOD_REMOTE_BROWSER, 'NOD_REMOTE_BROWSER'),
+              token: relayToken(env.NOD_REMOTE_TOKEN),
+            })
+          : createContainerBrowserComputer({ dataRoot, container: env.BROWSER_CONTAINER }),
     passwordManager: createOnePassword({
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
@@ -490,7 +502,13 @@ export function createDefaultAdapters(
     workspace:
       runtime === 'kubernetes'
         ? createKubernetesWorkspace({ namespace, workspaceRoot: join(dataRoot, 'workspaces') })
-        : createDockerWorkspace({
+        : runtime === 'remote'
+          ? createRemoteWorkspace({
+              address: relayAddress(env.NOD_REMOTE_WORKSPACE, 'NOD_REMOTE_WORKSPACE'),
+              token: relayToken(env.NOD_REMOTE_TOKEN),
+              workspaceRoot: join(dataRoot, 'workspaces'),
+            })
+          : createDockerWorkspace({
             container: env.WORKSPACE_CONTAINER || 'nod-workspace',
             workspaceRoot: join(dataRoot, 'workspaces'),
           }),

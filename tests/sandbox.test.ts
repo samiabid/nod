@@ -3,6 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
+import type { AddressInfo } from 'node:net';
 import {
   chmod,
   lstat,
@@ -42,6 +43,13 @@ import {
   workspaceFile,
 } from '../src/providers/docker/index.ts';
 import { runProcess, serviceEnvironment } from '../src/providers/process.ts';
+import { createRemoteWorkspace, relayProcess } from '../src/providers/remote/index.ts';
+import {
+  browserCommand,
+  startRelay,
+  workspaceCommand,
+  type RelayRequest,
+} from '../src/providers/remote/relay.mjs';
 import { prepareLocalDirectories } from '../scripts/local-database.ts';
 import { createLocalFiles, localFileRules } from '../src/server/local-files.ts';
 import type { Pool } from 'pg';
@@ -422,6 +430,143 @@ test('workspace transport startup grace preserves the command deadline', async (
     assert.match(error.message, /time or output limit/);
     return true;
   });
+});
+
+async function localRelay(role: 'workspace' | 'browser', token: string) {
+  const requests: RelayRequest[] = [];
+  const server = await startRelay({
+    role,
+    token,
+    host: '127.0.0.1',
+    port: 0,
+    env: { PATH: process.env.PATH },
+    command: (request) => {
+      requests.push(request);
+      return request.program === undefined
+        ? ['sh', '-c', 'echo $$ > "$0"; exec sleep 30', String(request.cwd)]
+        : ['python3', '-I', '-u', '-c', request.program];
+    },
+  });
+  const { port } = server.address() as AddressInfo;
+  return { server, requests, address: { host: '127.0.0.1', port } };
+}
+
+function alive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test('remote runtime runs workspace commands only through an authenticated relay', async (t) => {
+  const token = randomUUID().replaceAll('-', '');
+  const relay = await localRelay('workspace', token);
+  t.after(() => relay.server.close());
+  const threadId = 'remote-thread';
+  const open = (workspace: ReturnType<typeof createRemoteWorkspace>, signal: AbortSignal) =>
+    workspace.open({ threadId, workspacePath: join('/data/workspaces', threadId), signal });
+  const workspace = createRemoteWorkspace({
+    address: relay.address,
+    token,
+    workspaceRoot: '/data/workspaces',
+  });
+  const chunks: Buffer[] = [];
+  const session = open(workspace, new AbortController().signal);
+  const result = await session.exec('printf ready; printf problem >&2; exit 37', {
+    onData: (chunk) => chunks.push(chunk),
+  });
+  assert.equal(result.exitCode, 37);
+  assert.deepEqual(
+    [...Buffer.concat(chunks).toString().matchAll(/ready|problem/g)].map(([word]) => word).sort(),
+    ['problem', 'ready'],
+  );
+  assert.deepEqual(
+    relay.requests.map(({ role, uid, gid, cwd }) => ({ role, uid, gid, cwd })),
+    [{ role: 'workspace', uid: 1000, gid: 1000, cwd: `/workspace/${threadId}` }],
+  );
+
+  const stopped = new AbortController();
+  const started = Date.now();
+  setTimeout(() => stopped.abort(), 300);
+  await assert.rejects(
+    open(workspace, stopped.signal).exec('sleep 30'),
+    (error: unknown) => error instanceof WorkspaceCommandError && !error.uncertain,
+  );
+  assert.ok(Date.now() - started < 10_000);
+
+  const intruder = createRemoteWorkspace({
+    address: relay.address,
+    token: randomUUID().replaceAll('-', ''),
+    workspaceRoot: '/data/workspaces',
+  });
+  await assert.rejects(
+    open(intruder, new AbortController().signal).exec('printf stolen'),
+    (error: unknown) => error instanceof WorkspaceCommandError && error.uncertain,
+  );
+  assert.equal(relay.requests.length, 2);
+});
+
+test('a dropped relay connection ends the remote command and its process group', async (t) => {
+  const token = randomUUID().replaceAll('-', '');
+  const relay = await localRelay('browser', token);
+  const root = await mkdtemp(join(tmpdir(), 'nod-relay-'));
+  t.after(async () => {
+    relay.server.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  const pidFile = join(root, 'pid');
+  const child = relayProcess(relay.address, { role: 'browser', token, cwd: pidFile });
+  child.stdout.resume();
+  const closed = new Promise<number | null>((resolve) => child.on('close', resolve));
+  let pid = 0;
+  for (let attempt = 0; attempt < 50 && !pid; attempt++) {
+    await delay(100);
+    pid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+  }
+  assert.ok(pid > 0);
+  child.kill();
+  assert.equal(await closed, null);
+  for (let attempt = 0; attempt < 50 && alive(pid); attempt++) await delay(100);
+  assert.equal(alive(pid), false);
+  const wrongRole = relayProcess(relay.address, { role: 'workspace', token, program: 'print(1)' });
+  wrongRole.stdout.resume();
+  assert.equal(await new Promise((resolve) => wrongRole.on('close', resolve)), null);
+  assert.equal(relay.requests.length, 1);
+});
+
+test('the relay drops every command to an unprivileged user it chooses', async () => {
+  const program = 'print(1)';
+  const valid = workspaceCommand({ uid: 1000, gid: 1000, cwd: '/workspace/thread_1', program });
+  assert.deepEqual(valid?.slice(0, 9), [
+    '/usr/bin/setpriv',
+    '--reuid',
+    '1000',
+    '--regid',
+    '1000',
+    '--clear-groups',
+    '--no-new-privs',
+    '--bounding-set=-all',
+    '/usr/bin/env',
+  ]);
+  assert.equal(valid?.at(-1), program);
+  assert.ok(valid?.includes('/workspace/thread_1'));
+  assert.ok(workspaceCommand({ uid: 25_000, gid: 1002, cwd: '/var/tmp', program }));
+  for (const request of [
+    { uid: 0, gid: 0, cwd: '/workspace/thread', program },
+    { uid: 1000, gid: 0, cwd: '/workspace/thread', program },
+    { uid: 1000, gid: 1000, cwd: '/workspace/../etc', program },
+    { uid: 1000, gid: 1000, cwd: '/workspace/a/b', program },
+    { uid: 1000, gid: 1002, cwd: '/var/tmp', program },
+    { uid: 60_000, gid: 1002, cwd: '/var/tmp', program },
+    { uid: 1000, gid: 1000, cwd: '/workspace/thread' },
+  ])
+    assert.equal(workspaceCommand(request), undefined, JSON.stringify(request));
+  assert.deepEqual(browserCommand(false), [process.execPath, '/app/bridge.mjs']);
+  assert.deepEqual(browserCommand(true).slice(0, 8), valid?.slice(0, 8));
+  await assert.rejects(startRelay({ role: 'workspace', token: 'short', port: 0 }), /NOD_RELAY_TOKEN/);
+  await assert.rejects(startRelay({ role: 'admin', token: 'x'.repeat(32), port: 0 }), /NOD_RELAY_ROLE/);
 });
 
 test('connected CLIs run only their sealed install with a clean environment', async () => {

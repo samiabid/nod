@@ -43,7 +43,7 @@ The normal Nod stack includes PostgreSQL. A managed database is optional and is 
 
 ## Railway: understand the VM limits
 
-Railway's [Sandboxes](https://docs.railway.com/sandboxes) are Linux VMs, separate from its ordinary deployed services. They [include a Docker daemon and CLI](https://railway.com/changelog/2026-06-12-docker-in-sandboxes), so running sibling containers is possible. Deploying Nod's server image as an ordinary Railway service alone does not create its Docker runtime, browser, or workspace.
+Railway's [Sandboxes](https://docs.railway.com/sandboxes) are Linux VMs, separate from its ordinary deployed services. They [include a Docker daemon and CLI](https://railway.com/changelog/2026-06-12-docker-in-sandboxes), so running sibling containers is possible. Deploying Nod's server image as an ordinary Railway service alone does not create its Docker runtime, browser, or workspace. To run Nod as ordinary Railway services instead, use the [remote runtime](/deploy/self-host/#use-the-remote-runtime): separate server, workspace, browser, and PostgreSQL services billed at service rates, without the workspace firewall.
 
 Free and Trial Sandboxes are limited to two vCPUs and 2 GB RAM. They are destroyed after up to five idle minutes; only paid plans can disable that timeout. Active SSH, port-forwarding, or command sessions defer idle destruction. Background containers alone do not. Checkpoints preserve a disk snapshot, but they are not a replacement for a consistent database backup.
 

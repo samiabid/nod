@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=build /out ./
 COPY --chmod=555 src/providers/container-browser/xvfb.sh /usr/local/bin/Xvfb
+COPY --chmod=444 src/providers/remote/relay.mjs /opt/nod-relay/relay.mjs
 RUN mkdir /data && chown node:node /data && chmod 700 /data
 USER node
 CMD ["node", "/app/worker.mjs"]

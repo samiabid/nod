@@ -263,9 +263,56 @@ Audit all image layers for secrets before publishing to your approved registry. 
 This is a maintained fork integration, not an upstream Kubernetes installer. You own the manifests, network policies, storage, backups, image updates, and acceptance tests.
 :::
 
+## Use the remote runtime
+
+Platforms such as Railway, Render, and Fly.io run each service as its own container, with no Docker daemon, no volume shared between services, and no `NET_ADMIN`. Set `NOD_RUNTIME=remote` on the server to reach the workspace and browser over the platform's private network instead. Each of them runs a small relay from the same workspace and browser images.
+
+The relay accepts one command per connection, after checking a shared token. It runs only the workspace command program, as the workspace user or a connected CLI's user, or the browser bridge. It chooses the user and the program path itself and drops each command to that user with `setpriv`, clearing groups and capabilities and setting no-new-privileges. When the connection drops, it ends the command's whole process group.
+
+The server needs no shared workspace volume. It already moves workspace files through the command channel, and the relay creates each conversation's workspace folder on first use.
+
+### Configure the services
+
+Create four services: PostgreSQL, the server, the workspace, and the browser. Generate the token with `openssl rand -base64 48 | tr '+/' '-_' | tr -d '='` and set it on all three Nod services.
+
+| Service   | Image                              | Start command                                            | Volume         |
+| --------- | ---------------------------------- | -------------------------------------------------------- | -------------- |
+| Server    | `deployment/self-host/Dockerfile`  | See below                                                | `/var/lib/nod` |
+| Workspace | `Dockerfile.workspace`             | `node /opt/nod-relay/relay.mjs`                          | `/workspace`   |
+| Browser   | `Dockerfile.browser`               | `node /opt/nod-relay/relay.mjs -- node /app/worker.mjs` | `/data`        |
+
+| Variable               | Service              | Value                                                   |
+| ---------------------- | -------------------- | ------------------------------------------------------- |
+| `NOD_RUNTIME`          | Server               | `remote`                                                |
+| `NOD_REMOTE_WORKSPACE` | Server               | The workspace's private `host:port`, port `4320`        |
+| `NOD_REMOTE_BROWSER`   | Server               | The browser's private `host:port`, port `4320`          |
+| `NOD_REMOTE_TOKEN`     | Server               | The shared token                                        |
+| `NOD_RELAY_TOKEN`      | Workspace, browser   | The shared token                                        |
+| `NOD_RELAY_ROLE`       | Workspace, browser   | `workspace` or `browser`                                |
+| `NOD_RELAY_PREPARE`    | Workspace, browser   | The volume path, `/workspace` or `/data`                |
+| `NOD_RELAY_PORT`       | Workspace, browser   | Optional. Defaults to `4320`                            |
+
+Set `DATABASE_URL`, `NOD_AUTH_TOKEN`, `NOD_VAULT_KEY`, `NOD_PUBLIC_URL`, and `PORT` on the server as for any self-hosted server.
+
+The relays start as root so they can give their volume to UID 1000 and drop each command to its user. The workspace relay refuses to start without root. Platform volumes usually mount as root too, so start the server as root and drop to `node` once its data folder is ready:
+
+```sh title="Server start command"
+sh -c 'mkdir -p /var/lib/nod/workspaces && chown node:node /var/lib/nod /var/lib/nod/workspaces && exec env HOME=/home/node setpriv --reuid=1000 --regid=1000 --init-groups node --import tsx src/server/index.ts'
+```
+
+On Railway, set `RAILWAY_RUN_UID=0` on all three Nod services and `RAILWAY_DOCKERFILE_PATH` to each image's Dockerfile. Private addresses are `<service>.railway.internal`, and the server's public domain targets port `4310`.
+
+### Know the limits
+
+The workspace firewall can't run without `NET_ADMIN`. The workspace reaches the public internet and every service on the project's private network, including PostgreSQL and the server. The relay token, the database password, and `NOD_AUTH_TOKEN` still protect those services. Keep Nod in its own project, and add nothing to that private network that trusts its callers. Railway blocks cloud metadata addresses; check your platform before you use it.
+
+`/home/node` and connected CLI installations in `/var/tmp` live in the container, so a restart clears installed tools. Nod reinstalls connected CLIs on next use. The workspace volume keeps conversation files, and the browser volume keeps browser profiles.
+
+Back up the database, all three volumes, and the server's variables together. Approvals, the trust check, Vault, sign-in, and owner isolation work as in Compose.
+
 ## Keep it running
 
-For Docker installations, the containers restart when Docker starts. On a Mac, Docker Desktop starts after you sign in when its startup setting is enabled. Kubernetes installations use the restart and replacement behavior of their Deployments and StatefulSets instead.
+For Docker installations, the containers restart when Docker starts. On a Mac, Docker Desktop starts after you sign in when its startup setting is enabled. Kubernetes installations use the restart and replacement behavior of their Deployments and StatefulSets instead, and remote-runtime services follow their platform's restart policy.
 
 Follow [Back up and update a server](/deploy/server-operations/) before your first update. Keep the Vault key with your backup; the database alone cannot recover saved credentials.
 
