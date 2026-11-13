@@ -30,6 +30,14 @@
   <img alt="Status: research preview" src="https://img.shields.io/badge/status-research_preview-ff91ac?style=flat-square&labelColor=191919" />
 </p>
 
+<p align="center">
+  <a href="https://railway.com/deploy/nod-community-no-docker"><img src="https://railway.com/button.svg" alt="Deploy on Railway" /></a>
+</p>
+
+<p align="center">
+  <sub>This community fork adds a <a href="docs/src/content/docs/deploy/self-host.mdx#use-the-remote-runtime">remote runtime</a> so Nod runs as ordinary Railway services, without a Docker host. It isn't made or supported by n8n. Proposed upstream in <a href="https://github.com/n8n-io/nod/discussions/833">discussion #833</a>.</sub>
+</p>
+
 <br />
 
 <p align="center">
