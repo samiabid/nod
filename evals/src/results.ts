@@ -85,6 +85,7 @@ export interface RunManifest {
   dirty: boolean;
   ref?: string;
   model: string;
+  backgroundModel?: string;
   effort?: import('../../src/shared/models.ts').ModelEffort;
   judge: string;
   repeat: number;

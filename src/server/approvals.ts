@@ -20,6 +20,13 @@ import { withdrawnSql } from './turn-chain.ts';
 import { afterCommit, transaction } from './transaction.ts';
 import type { CaptureAnalytics } from './analytics.ts';
 import type { TrustBasis } from './trust-basis.ts';
+import {
+  ownerChatRevision,
+  validateInstructionChange,
+  validateOwnerInstructions,
+  type InstructionChange,
+  type OwnerInstructions,
+} from './owner-instructions.ts';
 
 export interface ApprovalExecutionContext {
   threadId: string;
@@ -29,6 +36,7 @@ export interface ApprovalExecutionContext {
   details?: Record<string, unknown>;
   expectedRevision?: number;
   basis?: TrustBasis;
+  instructionChange?: InstructionChange;
 }
 
 export interface ApprovalWork {
@@ -160,16 +168,15 @@ async function scheduleAuthority(client: PoolClient, turnId: string) {
     return undefined;
   return (
     await client.query<{
-      authority_instruction: string | null;
-      authority_source_message_id: string | null;
+      authority: OwnerInstructions | null;
       scheduled_for: Date;
       time_zone: string;
       title: string;
       kind: string | null;
     }>(
-      `SELECT r.authority_instruction,r.authority_source_message_id,r.scheduled_for,r.time_zone,r.title,s.kind
-       FROM schedule_runs r LEFT JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
-       WHERE r.turn_id=$1 AND r.owner_id=$2`,
+      `SELECT to_jsonb(r)->'authority' AS authority,r.scheduled_for,r.time_zone,r.title,s.kind
+     FROM schedule_runs r LEFT JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+     WHERE r.turn_id=$1 AND r.owner_id=$2`,
       [turnId, ownerId],
     )
   ).rows[0];
@@ -180,13 +187,19 @@ async function workOf(
   taskId: string | null,
   schedule: Awaited<ReturnType<typeof scheduleAuthority>>,
 ): Promise<ApprovalWork | undefined> {
-  if (schedule)
+  if (schedule) {
+    const ownerRequest = schedule.authority?.messages
+      .filter((message) => message.canAuthorize !== false)
+      .map((message) => message.text)
+      .filter(Boolean)
+      .join('\n\n');
     return {
       kind: 'schedule',
       title: schedule.title,
-      ...(schedule.authority_instruction ? { ownerRequest: schedule.authority_instruction } : {}),
+      ...(ownerRequest ? { ownerRequest } : {}),
       ...(schedule.kind === 'recurring' ? { waitsForAnswer: true as const } : {}),
     };
+  }
   if (!taskId) return undefined;
   const task = (
     await client.query<{ title: string; request: string | null }>(
@@ -236,7 +249,7 @@ export async function turnOrigin(turnId: string) {
       source: origin.source,
       messageIds: said,
       channel: current.channel,
-      scheduleInstruction: run?.authority_instruction ?? undefined,
+      scheduleInstruction: run?.authority ?? undefined,
       ...(run
         ? {
             scheduledFor: localTimestamp(run.time_zone, run.scheduled_for),
@@ -311,8 +324,15 @@ export async function createApprovals(
       expectedRevision?: number;
       expectedChatRevision?: string;
       basis?: TrustBasis;
+      instructionChange?: InstructionChange;
     } = {},
   ) {
+    const instructionChange = options.instructionChange
+      ? structuredClone(options.instructionChange)
+      : undefined;
+    const replacesInstruction =
+      action === 'NOD_schedule_create' ||
+      (action === 'NOD_schedule_update' && typeof instructionChange?.changes.prompt === 'string');
     const encoded = JSON.stringify(args);
     if (!encoded) throw new Error('The action has no arguments to save.');
     const snapshot = JSON.parse(encoded) as Record<string, unknown>;
@@ -345,12 +365,16 @@ export async function createApprovals(
       let authorMessageId: string | null;
       const schedule =
         origin.source === 'schedule' ? await scheduleAuthority(client, origin.id) : undefined;
+      if (schedule?.authority) await validateOwnerInstructions(client, ownerId, schedule.authority);
       if (steering) {
         authorMessageId = steering.id;
       } else if (origin.source === 'event') {
         authorMessageId = null;
       } else if (origin.source === 'schedule') {
-        authorMessageId = schedule?.authority_source_message_id ?? null;
+        authorMessageId =
+          schedule?.authority?.messages.find(
+            (message) => message.canAuthorize !== false && message.id,
+          )?.id ?? null;
       } else {
         const author =
           origin.source === 'user' && origin.message_id
@@ -448,7 +472,16 @@ export async function createApprovals(
           turn: { ...turn },
           action,
           args: JSON.parse(encoded),
-          ...(details ? { details: JSON.parse(details) } : {}),
+          ...(details || (replacesInstruction && instructionChange)
+            ? {
+                details: {
+                  ...(details ? JSON.parse(details) : {}),
+                  ...(replacesInstruction && instructionChange
+                    ? { scheduleDefinition: instructionChange.after }
+                    : {}),
+                },
+              }
+            : {}),
           ...(existing.work ? { work: existing.work } : {}),
         },
         options.signal,
@@ -462,26 +495,17 @@ export async function createApprovals(
         throw new Error('The confirmation model did not produce a valid action label.');
     }
     const saveProposal = async (client: PoolClient) => {
-      if (options.expectedChatRevision !== undefined) {
-        const latest = (
-          await client.query<{ id: string }>(
-            `SELECT m.id FROM messages m WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.role='user' AND m.hidden_at IS NULL
-               AND EXISTS (SELECT 1 FROM turns s WHERE s.owner_id=$1 AND s.thread_id=m.thread_id AND s.source='user'
-                 AND (s.message_id=m.id OR s.id=m.turn_id))
-               AND NOT EXISTS (SELECT 1 FROM turns u WHERE u.owner_id=$1 AND (u.message_id=m.id OR u.id=m.turn_id)
-                 AND to_jsonb(u)->>'task_id' IS NOT NULL)
-               ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
-            [ownerId, turn.threadId],
-          )
-        ).rows[0]?.id;
-        if (latest !== options.expectedChatRevision)
-          throw Object.assign(
-            conflict(
-              'The chat changed while this action was being checked. This action did not run. Please ask again.',
-            ),
-            { notRun: true },
-          );
-      }
+      if (
+        options.expectedChatRevision !== undefined &&
+        (await ownerChatRevision(client, ownerId, turn.threadId)) !== options.expectedChatRevision
+      )
+        throw Object.assign(
+          conflict(
+            'The chat changed while this action was being checked. This action did not run. Please ask again.',
+          ),
+          { notRun: true },
+        );
+      if (instructionChange) await validateInstructionChange(client, ownerId, instructionChange);
       const inspected = await inspect(client);
       if ('cached' in inspected) return inspected;
       await options.validate?.(client);
@@ -494,7 +518,7 @@ export async function createApprovals(
       );
       const approval = (
         await client.query(
-          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details,title) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb,$11) RETURNING *",
+          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details,title,instruction_change) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb,$11,$12::jsonb) RETURNING *",
           [
             randomUUID(),
             ownerId,
@@ -507,6 +531,7 @@ export async function createApprovals(
             expectedRevision ?? null,
             details ?? null,
             title ?? null,
+            instructionChange ? JSON.stringify(instructionChange) : null,
           ],
         )
       ).rows[0];
@@ -540,6 +565,7 @@ export async function createApprovals(
       ...(options.details ? { details: options.details } : {}),
       ...(expectedRevision === undefined ? {} : { expectedRevision }),
       ...(allowed && options.basis ? { basis: options.basis } : {}),
+      ...(instructionChange ? { instructionChange: instructionChange } : {}),
     });
   }
 
@@ -708,12 +734,16 @@ export async function createApprovals(
         )
       ).rows[0];
       if (!selected) return undefined;
-      const refused = await preflight?.(
-        selected.action,
-        selected.args,
-        selected.expected_revision ?? undefined,
-        client,
-      ).then(
+      const refused = await (async () => {
+        if (selected.instruction_change)
+          await validateInstructionChange(client, ownerId, selected.instruction_change);
+        return preflight?.(
+          selected.action,
+          selected.args,
+          selected.expected_revision ?? undefined,
+          client,
+        );
+      })().then(
         () => undefined,
         (error: unknown) => ({ error }),
       );
@@ -737,6 +767,42 @@ export async function createApprovals(
           sourceMessageId: approval.source_message_id,
           signal,
           ...(approval.details ? { details: approval.details } : {}),
+          ...(approval.instruction_change
+            ? {
+                instructionChange: {
+                  ...approval.instruction_change,
+                  replaceInstruction:
+                    approval.action === 'NOD_schedule_create' ||
+                    (approval.action === 'NOD_schedule_update' &&
+                      typeof approval.instruction_change.changes.prompt === 'string'),
+                  evidence:
+                    approval.action === 'NOD_schedule_create' ||
+                    (approval.action === 'NOD_schedule_update' &&
+                      typeof approval.instruction_change.changes.prompt === 'string')
+                      ? {
+                          messages: [],
+                          approvals: [
+                            {
+                              id: approval.id,
+                              at: new Date().toISOString(),
+                              definition: approval.instruction_change.after,
+                            },
+                          ],
+                        }
+                      : {
+                          messages: [
+                            {
+                              id: null,
+                              approvalId: approval.id,
+                              at: new Date().toISOString(),
+                              text: '',
+                              fields: approval.instruction_change.changes,
+                            },
+                          ],
+                        },
+                },
+              }
+            : {}),
           ...(approval.expected_revision === null
             ? {}
             : { expectedRevision: approval.expected_revision }),

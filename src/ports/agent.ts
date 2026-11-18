@@ -13,6 +13,7 @@ import type {
   SpeechReplyMode,
 } from '../shared/contracts.ts';
 import type { ProactiveIssue } from '../shared/proactivity.ts';
+import type { ModelSelection } from '../shared/models.ts';
 import type { MemoryBrief } from './memory-recall.ts';
 
 export interface ModelUsageObservation {
@@ -117,10 +118,12 @@ export interface RuntimeContext {
   turnId: string;
   sessionId: string;
   resumed?: boolean;
+  contextRestart?: string;
   prompt: string;
   audioCaption?: string;
   background?: boolean;
   scheduleCache?: 'short' | 'long';
+  model?: ModelSelection;
   channel?: string;
   runtimeHost?: 'desktop' | 'server';
   timeZone?: string;
@@ -134,6 +137,7 @@ export interface RuntimeContext {
   localFiles?: boolean;
   mcpServers?: ConnectedMcpServer[];
   currentMessageId?: string;
+  automatic?: boolean;
   speech?: { mode: SpeechReplyMode; available: boolean };
   firstConversationTurn?: boolean;
   replyTo?: {
@@ -341,7 +345,7 @@ export type AgentEvent =
   | { type: 'retry'; model: string; attempt: number; attempts: number }
   | { type: 'final'; text: string }
   | ModelUsageObservation
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; contextExhausted?: boolean };
 export interface AgentAudio {
   id: string;
   mimeType: string;
@@ -355,11 +359,13 @@ export interface AgentToolOutcome {
   error?: string;
 }
 export interface AgentSessionOptions extends ExecutionScope {
+  model?: ModelSelection;
   automatic?: boolean;
   restricted?: boolean;
   ephemeral?: boolean;
-  restartable?: boolean;
+  newRequest?: boolean;
   scheduleCache?: 'short' | 'long';
+  contextRestart?: string;
   keepWarm?(): Promise<boolean>;
   systemPrompt: string;
   ownerContext?: string;
@@ -382,7 +388,7 @@ export interface AgentSession {
   resumed: boolean;
   readsImages?: boolean;
   readsAudio?: boolean;
-  contextWindow?: number;
+  compactContext?: boolean;
   prompt(
     text: string,
     images: AgentImage[],
@@ -397,3 +403,4 @@ export interface Agent {
   dispose(): void | Promise<void>;
 }
 export class ModelRequestError extends Error {}
+export class ContextLimitError extends ModelRequestError {}

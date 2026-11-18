@@ -75,7 +75,7 @@ The trace also includes Nod's instructions, the model name, token counts, and co
 | Switch         | **Share conversation traces**                                                                           |
 | Details        | [Conversation traces](/trust/conversation-traces/)                                                      |
 
-Both switches are in **Settings → Privacy & data**. Turning one off stops subsequent sends, though a send already in flight may finish. It does not delete data already sent, including About you answers and a consented email. To request deletion, use **Send feedback**. A server operator can turn either switch off for everyone.
+Both switches are in **Settings → Privacy & data**. Turning one off stops subsequent sends, though a send already in flight may finish. It does not delete data already sent, including About you answers and a consented email. To request deletion, write to privacy@n8n.io. A server operator can turn either switch off for everyone.
 
 On a fresh packaged desktop profile, the default-on usage setting can send the first native setup-window open before you reach this switch. Turning sharing off later stops new sends but cannot recall that opening event.
 
@@ -124,7 +124,11 @@ For the other controls, see [How Nod protects app connections](/connect/apps/#ho
 
 ## Feedback
 
-**Send feedback** goes to the recipient the dialog names, which is the Nod team at n8n by default. It includes a diagnostic report unless you untick it. The report can include recent messages and tool results, with known secrets and recognized personal details masked. Select **Review** to check it before you send. On desktop, the draft also includes a screenshot of the Nod window, which you can remove.
+A report sent with **Report bug** goes to the recipient the dialog names, which is the Nod team at n8n by default. It includes a diagnostic report unless you untick it. The report can include recent messages and tool results, with known secrets and recognized personal details masked. It also includes technical details about your setup: operating system version, memory, time zone, the selected model, settings such as quiet hours and spending limits, recent failures, and the desktop startup and update log. Select **Review** to check it before you send. On desktop, the draft also includes a screenshot of the Nod window, which you can remove.
+
+A bug report Nod drafts in chat sends Nod's written summary as you see it, without masking, plus the app version and platform. From the card in Nod it also sends the diagnostic report unless you untick it, and you can review it first. A reply in Telegram or WhatsApp sends the summary and those technical details, without the diagnostic report. Nothing goes until you select **Send report** or reply to send it.
+
+Your Nod runtime redacts the report before it goes to the recipient the dialog names. It masks the names, addresses, account identifiers, file paths and links it recognizes, and keeps technical values such as versions, error types and status codes. Redaction can miss personal details, so review the report before you send it.
 
 See [Report contents and limits](/deploy/troubleshooting/#report-contents-and-limits).
 
@@ -136,7 +140,7 @@ Nod sends the address only when you enter it, tick that box, and select **Start 
 
 The checkbox controls the email, not the fixed About you answers. Ordinary usage events do not carry the address. If you leave the address blank or sharing is off, Nod does not send it.
 
-Submitting the form sends no email immediately. Updates require a later email confirmation flow before they are sent. If submission fails partway through, your address may already be in PostHog or Customer.io; you can retry or request deletion. After updates begin, the unsubscribe link in each email stops future emails; it does not unlink your address from usage data. To unlink your address or request deletion of stored answers and contact data, use **Send feedback** or write to privacy@n8n.io. Turning off **Share usage data** stops new analytics and profile updates, but a submission already in flight may still finish. It does not delete data already in PostHog or Customer.io. See n8n's [privacy policy](https://n8n.io/legal/privacy/).
+Submitting the form sends no email immediately. Updates require a later email confirmation flow before they are sent. If submission fails partway through, your address may already be in PostHog or Customer.io; you can retry or request deletion. After updates begin, the unsubscribe link in each email stops future emails; it does not unlink your address from usage data. To unlink your address or request deletion of stored answers and contact data, write to privacy@n8n.io. Turning off **Share usage data** stops new analytics and profile updates, but a submission already in flight may still finish. It does not delete data already in PostHog or Customer.io. See n8n's [privacy policy](https://n8n.io/legal/privacy/).
 
 ## What memory learns from
 
@@ -150,7 +154,7 @@ Memory notes come only from your own messages, your answers in setup's About you
 - **Everything in the desktop app:** select **Remove all data** in **Settings → Privacy & data**. Nod deletes your profile, its private computer, and unsent drafts, then opens setup again. The app stays installed, and no server data is deleted.
 - **A source install or server:** stop it, then remove its data folder and Docker volumes. See [Server operations](/deploy/server-operations/).
 
-Uninstalling the desktop app keeps its data. A connected service may still list Nod until you remove it there. To remove n8n's connection service records, use **Send feedback**.
+Uninstalling the desktop app keeps its data. A connected service may still list Nod until you remove it there. To remove n8n's connection service records, write to privacy@n8n.io.
 
 :::caution
 You can't clear only your chat history yet. **Remove all data** deletes it along with everything else.

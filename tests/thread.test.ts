@@ -7,7 +7,7 @@ import {
 } from '../src/shared/answer-choices.ts';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,7 +25,12 @@ import {
   type FeedbackReceipt,
   type FeedbackSubmission,
 } from '../src/shared/feedback.ts';
-import { ModelRequestError, type RuntimeContext, type RuntimeResult } from '../src/ports/agent.ts';
+import {
+  ContextLimitError,
+  ModelRequestError,
+  type RuntimeContext,
+  type RuntimeResult,
+} from '../src/ports/agent.ts';
 import type { ConnectedApp } from '../src/ports/integrations.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import { ObjectStoreConflict, type PrivateObjectStore } from '../src/ports/object-storage.ts';
@@ -417,7 +422,6 @@ test(
     vault.registerRoutes(app);
     createAccountSession({
       accounts,
-      origin: `http://localhost:${port}`,
       localUser: { id: ownerId, name: 'You', email: null, avatarUrl: null },
       start: () => onboarding.complete(),
     }).register(app);
@@ -487,7 +491,7 @@ test(
 
     let limitReached = false;
     const interruptedText = 'Synthetic interrupted turn.';
-    const modelErrors = new Map<string, string>();
+    const modelErrors = new Map<string, string | ModelRequestError>();
     let beforeRuntimeFailure = async (_context: RuntimeContext) => {};
     let presentInterruption: NonNullable<ThreadDependencies['present']> = async () =>
       interruptedText;
@@ -602,6 +606,8 @@ test(
           return { status: 'succeeded' };
         }
         if (context.prompt === 'limit race fixture') throw new Error(spendingLimitReached);
+        if (context.prompt === 'unexpected failure fixture')
+          throw new Error('Synthetic runtime failure.');
         if (context.prompt.startsWith('session-fixture')) {
           await sessionGates.get(context.prompt);
           return { status: 'succeeded' };
@@ -693,7 +699,8 @@ test(
           stagedReads.set(context.prompt, await readFile(context.attachments[0].path, 'utf8'));
         workspaceListings.set(context.prompt, await readdir(context.workspacePath));
         const modelError = modelErrors.get(context.prompt);
-        if (modelError) throw new ModelRequestError(modelError);
+        if (modelError)
+          throw typeof modelError === 'string' ? new ModelRequestError(modelError) : modelError;
         if (context.prompt === 'runtime-failure') {
           await beforeRuntimeFailure(context);
           throw Object.assign(new Error('Synthetic runtime failure for private-fixture'), {
@@ -2881,6 +2888,28 @@ test(
             background: true,
           });
           await completed(ownerResume, 'scheduled', true, 'reply');
+          const signedIn = await thread.enqueueTurn('Synthetic analytics sign-in continuation', {
+            source: 'resume',
+            sourceId: `credentials:${schedule}`,
+            sessionId: schedule,
+            parentTurnId: schedule,
+            background: true,
+          });
+          await completed(signedIn, 'scheduled', false, 'reply');
+          const taskCheck = await thread.enqueueTurn('Synthetic analytics planned check', {
+            source: 'resume',
+            sourceId: `task-check:${randomUUID()}:1`,
+            sessionId: schedule,
+            parentTurnId: schedule,
+            background: true,
+          });
+          await completed(taskCheck, 'scheduled', false, 'reply');
+          assert.deepEqual(
+            [requested.turnId, schedule, task, answer.turnId, signedIn, taskCheck].map(
+              (id) => ran(id)?.automatic,
+            ),
+            [false, true, true, false, false, true],
+          );
           const inspect = inspectObserver;
           try {
             inspectObserver = async (context) => {
@@ -3174,6 +3203,29 @@ test(
           }
         },
       );
+
+      await t.test('an unexpected turn failure offers a bug report', async () => {
+        const failed = await thread.submitUserMessage('unexpected failure fixture');
+        await waitFor(settled(failed.turnId));
+        const shown = async () =>
+          (
+            await db.pool.query(
+              "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows.map((row) => row.presentation);
+        await waitFor(async () => (await shown()).length === 1);
+        const card = (await shown())[0];
+        assert.equal(card.type, 'bug-report');
+        const draft = (
+          await db.pool.query('SELECT owner_id,summary FROM feedback_drafts WHERE id=$1', [
+            card.draftId,
+          ])
+        ).rows[0];
+        assert.equal(draft.owner_id, ownerId);
+        assert.equal(draft.summary, card.summary);
+        assert.doesNotMatch(draft.summary, /Synthetic runtime failure/);
+      });
 
       await t.test('a reached spending limit pauses all but owner messages', async (t) => {
         const raced = await thread.submitUserMessage('limit race fixture');
@@ -6230,6 +6282,156 @@ test(
         },
       );
 
+      await t.test(
+        'a successful reply clears an earlier context failure without a restart',
+        async () => {
+          await waitFor(settledThread);
+          const question = await thread.submitUserMessage('ask-question');
+          await waitFor(settled(question.turnId));
+          const prompt = 'Synthetic context failure before a successful answer';
+          modelErrors.set(prompt, new ContextLimitError('Synthetic context window exceeded.'));
+          try {
+            const failed = await thread.submitUserMessage(prompt);
+            await waitFor(settled(failed.turnId));
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const asked = state.messages.find(
+              (message: { role: string; turnId: string }) =>
+                message.role === 'assistant' && message.turnId === question.turnId,
+            );
+            assert.ok(asked);
+            const answer = await thread.submitUserMessage('Synthetic successful answer', [], {
+              replyToMessageId: asked.id,
+            });
+            await waitFor(settled(answer.turnId));
+            assert.equal(await turnStatus(answer.turnId), 'succeeded');
+            assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
+            assert.equal(
+              (
+                await request('POST', '/api/conversation/restart-context', {
+                  threadId: failed.threadId,
+                  turnId: failed.turnId,
+                })
+              ).statusCode,
+              409,
+            );
+          } finally {
+            modelErrors.delete(prompt);
+          }
+        },
+      );
+
+      await t.test(
+        'a context restart keeps chat, files and independent work and refuses stale requests',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const backgroundPrompt = 'Synthetic independent work during context recovery';
+          const failedPrompt = 'Synthetic chat context failure';
+          block(backgroundPrompt);
+          modelErrors.set(
+            failedPrompt,
+            new ContextLimitError('Synthetic context window exceeded.'),
+          );
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          try {
+            await waitFor(() => Boolean(ran(background)));
+            const held = ran(background)!;
+            const file = join(held.workspacePath, 'context-recovery.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const earlierPrompt = 'Synthetic completed chat before context recovery';
+            const earlier = await thread.submitUserMessage(earlierPrompt);
+            await waitFor(settled(earlier.turnId));
+            const question = await thread.submitUserMessage('ask-question');
+            await waitFor(settled(question.turnId));
+            const failed = await thread.submitUserMessage(failedPrompt);
+            await waitFor(settled(failed.turnId));
+            assert.equal(await turnStatus(failed.turnId), 'failed');
+            assert.equal(await turnStatus(question.turnId), 'waiting');
+            await waitFor(async () =>
+              Boolean(
+                (
+                  await db.pool.query('SELECT 1 FROM messages WHERE turn_id=$1 AND stream_id=$2', [
+                    failed.turnId,
+                    `context-failure:${failed.turnId}`,
+                  ])
+                ).rowCount,
+              ),
+            );
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const messageIds = state.messages.map((message: { id: string }) => message.id);
+            const restart = (input = { threadId, turnId: failed.turnId }) =>
+              request('POST', '/api/conversation/restart-context', input);
+            assert.equal(
+              (
+                await app.inject({
+                  method: 'POST',
+                  url: '/api/conversation/restart-context',
+                  headers: { host: headers.host },
+                  payload: { threadId, turnId: failed.turnId },
+                })
+              ).statusCode,
+              401,
+            );
+            for (const input of [
+              { threadId: randomUUID(), turnId: failed.turnId },
+              { threadId, turnId: randomUUID() },
+              { threadId, turnId: background },
+            ])
+              assert.equal((await restart(input)).statusCode, 409);
+            const previousNodeEnv = process.env.NODE_ENV;
+            process.env.NODE_ENV = 'production';
+            try {
+              assert.equal((await restart()).statusCode, 200);
+            } finally {
+              if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+              else process.env.NODE_ENV = previousNodeEnv;
+            }
+            const recovered = (await request('GET', '/api/state')).json();
+            assert.equal(recovered.threadId, threadId);
+            assert.equal(recovered.chatRecovery, undefined);
+            assert.ok(
+              messageIds.every((id: string) =>
+                recovered.messages.some((message: { id: string }) => message.id === id),
+              ),
+            );
+            assert.equal((await restart()).statusCode, 409);
+            assert.equal(held.signal.aborted, false);
+            assert.equal(held.contextRestart, undefined);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const next = await thread.submitUserMessage('Synthetic request after context recovery');
+            await waitFor(settled(next.turnId));
+            const context = ran(next.turnId)!;
+            assert.equal(context.threadId, threadId);
+            assert.equal(context.sessionId, threadId);
+            assert.equal(context.workspacePath, held.workspacePath);
+            assert.ok(context.contextRestart);
+            assert.ok(context.history.every((message) => !message.text.includes(failedPrompt)));
+            assert.ok(context.history.every((message) => !message.text.includes(earlierPrompt)));
+            assert.equal(
+              (await request('GET', '/api/messages/search?q=Synthetic%20chat%20context%20failure'))
+                .json()
+                .some((message: { turnId: string }) => message.turnId === failed.turnId),
+              true,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT archived_at FROM threads WHERE id=$1', [threadId]))
+                .rows[0].archived_at,
+              null,
+            );
+          } finally {
+            modelErrors.delete(failedPrompt);
+            release(backgroundPrompt);
+            await waitFor(settled(background));
+          }
+        },
+      );
+
       let freshThread = '';
       await t.test(
         'reset archives the thread, revokes old work and resumes on a fresh thread while preserving saved data',
@@ -7345,6 +7547,39 @@ test(
                     next.turnId,
                   ]);
                 }
+                await reset();
+                await db.pool.query(
+                  "INSERT INTO proactive_sources(owner_id,source_id,label,status,revision,cursor) VALUES($1,$2,'Synthetic source','ready',$3,'synthetic-page-two')",
+                  [ownerId, sourceId, revision],
+                );
+                const until = new Date(Date.now() + 120_000);
+                sourceFailure = Object.assign(
+                  new Error(
+                    `The connection service is rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until.toISOString()}. Nod did not read this source. Do not retry this source now; it is checked again after that time.`,
+                  ),
+                  { statusCode: 429, status: 429, notRun: true },
+                );
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  sourceFailure,
+                );
+                const waiting = (
+                  await db.pool.query(
+                    'SELECT status,cursor,checked_at,next_poll FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.deepEqual(
+                  [waiting.status, waiting.cursor, waiting.checked_at],
+                  ['unavailable', 'synthetic-page-two', null],
+                );
+                assert.ok(waiting.next_poll > until);
+                const waitingReads = sourceReads;
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  /HTTP 429.*Do not retry this source now/,
+                );
+                assert.equal(sourceReads, waitingReads);
               },
             );
             await t.test(
@@ -9949,10 +10184,9 @@ test(
           const presentedFailures: string[] = [];
           presentInterruption = async (_threadId, input) => {
             if (input.kind === 'failed') presentedFailures.push(input.error);
-            return input.kind === 'failed' && input.error.includes('503 Service Unavailable')
-              ? 'Synthetic provider failure.'
-              : '';
+            return 'Synthetic presenter text.';
           };
+          dependencies.modelAlternative = () => 'Synthetic alternative connection.';
           const prefix = 'The model request failed: openrouter / anthropic/fixture-model: ';
           const nestedQuota =
             prefix +
@@ -10235,7 +10469,7 @@ test(
                   (
                     await db.pool.query(
                       "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
-                      [submitted.turnId, `failure:${submitted.turnId}`],
+                      [submitted.turnId, `model-failure:${submitted.turnId}`],
                     )
                   ).rowCount,
                 ),
@@ -10248,18 +10482,23 @@ test(
               const shown = (
                 await db.pool.query(
                   "SELECT text FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
-                  [submitted.turnId, `failure:${submitted.turnId}`],
+                  [submitted.turnId, `model-failure:${submitted.turnId}`],
                 )
               ).rows[0].text as string;
               assert.equal(turn.status, 'failed');
-              assert.equal(presentedFailures.at(-1), turn.error);
-              assert.ok(
-                shown.includes(
-                  item.prompt === 'model-unavailable-fixture'
-                    ? 'Synthetic provider failure.'
-                    : turn.error,
-                ),
+              assert.equal(presentedFailures.length, 0);
+              assert.ok(shown.includes(turn.error));
+              assert.equal(
+                (
+                  await db.pool.query(
+                    "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                    [submitted.turnId, `model-failure:${submitted.turnId}`],
+                  )
+                ).rows[0].presentation,
+                null,
               );
+              assert.match(shown, /Synthetic alternative connection\./);
+              assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
               assert.match(shown, /\]\(\/settings\/models\)/);
               assert.ok(turn.error.length <= 2000);
               assert.ok(turn.error.startsWith(prefix));
@@ -10278,6 +10517,7 @@ test(
           } finally {
             for (const item of cases) modelErrors.delete(item.prompt);
             presentInterruption = previousPresenter;
+            delete dependencies.modelAlternative;
           }
         },
       );
@@ -10606,7 +10846,7 @@ test(
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async () => {
     const { pool, ownerId, store, post, memory, close } = await memoryFixture();
-    const { state, curator } = scriptedCurator();
+    const { calls, state, curator } = scriptedCurator();
     const learning = createMemoryLearning({ pool, ownerId, memory, curator });
     const add = (area: string, slug: string, text: string) => (m: number) => ({
       op: 'add',
@@ -10634,6 +10874,17 @@ test(
         archived: [],
       });
       assert.equal(await memory.context(), `${path}: ${short}`);
+      const invented = randomUUID();
+      const asked = calls.length;
+      await assert.rejects(
+        learning.remember({ messages: [invented] }, first.sourceMessageId),
+        (error: Error) => error.message.includes(invented),
+      );
+      await assert.rejects(
+        learning.remember({ messages: [short] }, first.sourceMessageId),
+        (error: Error) => error.name !== 'ZodError' && !error.message.includes(short),
+      );
+      assert.equal(calls.length, asked);
       const reopened = createMemoryService({ pool, ownerId, store });
       assert.equal(((await reopened.read({ path })) as { text: string }).text, short);
       const detailed = 'Make progress reports detailed from now on.';
@@ -10736,6 +10987,15 @@ test(
       await remember([add('about', 'before-clear', beforeClear)], beforeClearMessage);
       assert.equal((await memory.view()).notes.length, 1);
       curator.curate = curate;
+
+      const older = await post('My synthetic library card renews in March.');
+      for (let index = 0; index < 10; index++) await post(`Synthetic filler ${index}.`);
+      const renewal = await post('Remember that renewal month.');
+      state.answer = () => ({ ops: [] });
+      await learning.remember({}, renewal.sourceMessageId);
+      assert.doesNotMatch(JSON.stringify(calls.at(-1)!.input), /renews in March/);
+      await learning.remember({ messages: [older.id] }, renewal.sourceMessageId);
+      assert.match(JSON.stringify(calls.at(-1)!.input), /renews in March/);
     } finally {
       await close();
     }
@@ -11137,6 +11397,46 @@ test(
 );
 
 test(
+  'bug report drafts send their stored summary once and only for their owner',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const f = await feedbackFixture(t);
+    await f.pool.query(`CREATE TABLE IF NOT EXISTS feedback_drafts (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL,
+      summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const owner = await f.open();
+    const other = await f.open();
+    const id = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [id, owner.ownerId, randomUUID(), 'Synthetic draft summary.'],
+    );
+    const send = {
+      method: 'POST' as const,
+      url: `/api/feedback/drafts/${id}/send`,
+      payload: { reportId: null },
+    };
+    assert.equal(
+      (await other.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).statusCode,
+      404,
+    );
+    assert.equal((await other.app.inject(send)).statusCode, 404);
+    assert.equal(f.state.envelopes.length, 0);
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal(f.state.envelopes.length, 1);
+    assert.equal(f.state.envelopes[0]!.submissionId, id);
+    assert.equal(f.state.envelopes[0]!.feedback, 'Synthetic draft summary.');
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).json().receipt
+        .status,
+      'submitted',
+    );
+  },
+);
+
+test(
   'feedback reports and their delivery status stay with their owner',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async (t) => {
@@ -11392,13 +11692,18 @@ test(
       CREATE TABLE app_connections(id uuid,owner_id text,slug text,account_id text,account_active boolean,revoked boolean,callback_expires timestamptz,triggers_enabled boolean,watch_failures integer,inbox_failed boolean,inbox_reconnect_required boolean,account_checked_at timestamptz,inbox_checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE browser_connections(id uuid,owner_id text,state text,checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE discovered_connections(id uuid,owner_id text,reconnect_required boolean,replaced_at timestamptz,paths jsonb,created_at timestamptz DEFAULT now());
-      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,models jsonb,request_failures jsonb,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_settings(owner_id text,selection jsonb,routes jsonb);
+      CREATE TABLE preferences(owner_id text,notification_rule text,time_zone text,quiet_start text,quiet_end text,quiet_hours_enabled boolean,locale text,hour_cycle text,rules text,speech_reply text,proactive_paused boolean,local_files_enabled boolean);
+      CREATE TABLE spending_limits(owner_id text,monthly_usd double precision,task_usd double precision,preparation_usd double precision);
+      CREATE TABLE channel_settings(owner_id text,provider text,enabled boolean,summary jsonb,updated_at timestamptz DEFAULT now());
       CREATE TABLE integration_events(id text,owner_id text,slug text,state text,created_at timestamptz DEFAULT now());
       CREATE TABLE schedules(id uuid,owner_id text,kind text,enabled boolean,delivery_channel text,next_run_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE schedule_runs(id uuid,owner_id text,schedule_id uuid,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_inbox(source_id text,owner_id text,provider text,state text,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_outbox(source_id text,state text,reason text,updated_at timestamptz DEFAULT now());
     `);
+    let modelConnection = '';
     const ownerId = randomUUID();
     const otherOwner = randomUUID();
     const turnId = randomUUID();
@@ -11538,8 +11843,31 @@ test(
         ],
       );
       await f.pool.query(
-        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed) VALUES($1,$2,$3,'api_key','reconnect',false)`,
-        [randomUUID(), owner, privateText],
+        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed,models,request_failures) VALUES($1,$2,$3,'api_key','reconnect',false,$4,'{}')`,
+        [
+          (modelConnection = randomUUID()),
+          owner,
+          privateText,
+          JSON.stringify([
+            { id: 'qwen2.5-coder:7b', name: privateText, contextWindow: 8192, efforts: ['low'] },
+            { id: 'models/Marta Vidal/private.gguf', contextWindow: 4096 },
+            { id: 'C:/Users/owner/private.gguf', contextWindow: 4096 },
+            { id: 'customer-jane/private-model', contextWindow: 4096 },
+          ]),
+        ],
+      );
+      await f.pool.query(`INSERT INTO model_settings VALUES($1,$2,'{"background":"light"}')`, [
+        owner,
+        { connectionId: modelConnection, modelId: 'qwen2.5-coder:7b', effort: 'low' },
+      ]);
+      await f.pool.query(
+        `INSERT INTO preferences VALUES($1,$2,'Europe/Lisbon','22:00','08:00',true,'pt-PT','auto',$2,'auto',true,false)`,
+        [owner, privateText],
+      );
+      await f.pool.query(`INSERT INTO spending_limits VALUES($1,200,5,5)`, [owner]);
+      await f.pool.query(
+        `INSERT INTO channel_settings(owner_id,provider,enabled,summary) VALUES($1,'whatsapp',true,$2)`,
+        [owner, { accountName: privateText, linkMode: 'self-chat', connectionState: 'logged_out' }],
       );
       await f.pool.query(
         `INSERT INTO integration_events(id,owner_id,slug,state) VALUES($1,$2,'gmail','processing')`,
@@ -11576,11 +11904,33 @@ test(
       ownerId,
       sanitize: redactor.value,
     });
+    const failureJournal = await createFeedbackLog({
+      dataRoot: logRoot,
+      ownerId,
+      name: 'failures',
+      sanitize: redactor.value,
+    });
     t.after(async () => {
       await journal.close();
+      await failureJournal.close();
       await rm(logRoot, { recursive: true, force: true });
     });
+    await mkdir(join(logRoot, 'logs'));
+    await writeFile(
+      join(logRoot, 'logs', 'startup.log'),
+      `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
+    );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    for (let index = 0; index < 3; index++)
+      failureJournal.record(
+        'failure',
+        {
+          event: 'browser_bridge_failed',
+          error: new Error('bridge exited'),
+          context: { reason: 'exit', exitCode: 137, count: 2 },
+        },
+        scope,
+      );
     journal.record(
       'tool_start',
       {
@@ -11633,6 +11983,11 @@ test(
         },
       ],
       logs: () => journal.snapshot(),
+      failures: () => failureJournal.snapshot(),
+      dataRoot: logRoot,
+      trustModel: 'llm',
+      client: { stream: 'closed' as const, savedMessages: 4, renderedMessages: 3 },
+      environment: { NOD_OS_VERSION: '15.1.0', NOD_ELECTRON_VERSION: privateText },
       errors: [
         {
           type: 'render' as const,
@@ -11667,8 +12022,9 @@ test(
       'future-message',
     ])
       assert.ok(!encoded.includes(omitted), omitted);
-    assert.doesNotMatch(encoded, /\d{4}-\d{2}-\d{2}T/);
     const report = JSON.parse(encoded);
+    assert.doesNotMatch(encoded.replace(report.generatedAt, ''), /\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Math.abs(Date.parse(report.generatedAt) - Date.now()) < 60_000);
     assert.equal(report.format, 'nod-feedback-report-v3');
     assert.equal(report.coverage.contentIncluded, true);
     assert.equal(report.coverage.redaction, 'best-effort');
@@ -11731,14 +12087,53 @@ test(
     );
     assert.equal(report.modelUsage.length, 1);
     assert.equal(report.modelUsage[0].runId, child.runId);
-    assert.equal(report.logs.length, 3);
+    assert.equal(report.logs.length, 2);
     assert.equal(report.logs[0].runId, child.runId);
     assert.equal(report.logs[0].parentRunId, child.parentRunId);
     assert.equal(report.logs[0].callId, report.logs[1].callId);
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.match(report.logs[2].data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(report.failures.length, 2);
+    const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
+    const bridgeFailure = report.failures.find(
+      (row: any) => row.data.event === 'browser_bridge_failed',
+    );
+    assert.match(requestFailure.data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(requestFailure.count, 1);
+    assert.equal(bridgeFailure.data.context.exitCode, 137);
+    assert.equal(bridgeFailure.count, 6);
+    assert.equal(bridgeFailure.runId, child.runId);
+    assert.equal(report.startupLog.length, 1);
+    assert.match(report.startupLog[0].line, /^update check result=offered version=9\.9\.9/);
+    assert.ok(report.startupLog[0].ageMs >= 5000);
+    assert.equal(report.system.osVersion, '15.1.0');
+    assert.equal(report.system.electron, null);
+    assert.ok(report.system.memoryMb > 0);
+    assert.deepEqual(report.client, { stream: 'closed', savedMessages: 4, renderedMessages: 3 });
+    assert.deepEqual(report.modelSettings, [
+      {
+        selection: {
+          connection: report.modelConnections[0].id,
+          model: 'qwen2.5-coder:7b',
+          effort: 'low',
+        },
+        schedule: null,
+        background: 'light',
+      },
+    ]);
+    assert.deepEqual(report.modelConnections[0].models, [
+      { id: 'qwen2.5-coder:7b', contextWindow: 8192, images: false, efforts: ['low'] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+    ]);
+    assert.equal(report.modelUsageSummary[0].requests, 1);
+    assert.equal(report.settings[0].timeZone, 'Europe/Lisbon');
+    assert.equal(report.settings[0].notificationRuleSet, true);
+    assert.equal(report.settings[0].monthlyLimitUsd, 200);
+    assert.equal(report.channelSettings[0].linkMode, 'self-chat');
+    assert.equal(report.channelSettings[0].connectionState, 'logged_out');
     assert.equal(report.clientErrors.length, 1);
     assert.match(report.clientErrors[0].data.message, /Could not open account/);
     for (const input of [
@@ -11757,7 +12152,12 @@ test(
     assert.equal(report.modelUsage[0].durationMs, 4321);
     assert.equal(report.modelUsage[0].costUsd, 0.01234);
     assert.equal(report.modelUsage[0].estimateUsd, 0.04567);
-    assert.deepEqual(report.runtime, { provider: 'other', modelFamily: 'custom' });
+    assert.deepEqual(report.runtime, {
+      provider: 'other',
+      modelFamily: 'custom',
+      model: null,
+      trustModel: 'llm',
+    });
     assert.equal(report.environment.appVersion, '1.2.3');
     assert.equal(report.environment.appRelease, null);
     assert.equal(report.environment.platform, null);
@@ -11830,6 +12230,10 @@ test(
       assert.equal(fallback.coverage.redaction, 'unavailable');
       assert.equal(fallback.coverage.sections.clientErrors.status, 'unavailable');
       assert.equal(fallback.coverage.sections.logs.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.failures.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.startupLog.status, 'unavailable');
+      assert.deepEqual(fallback.failures, []);
+      assert.deepEqual(fallback.startupLog, []);
       assert.equal(readLogs, false);
       assert.deepEqual(fallback.clientErrors, []);
       assert.deepEqual(fallback.logs, []);
@@ -12298,7 +12702,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const { createActivity } = await import('../src/server/activity.ts');
       const owner = 'activity-fixture-owner';
@@ -12401,6 +12805,59 @@ test(
       item = await live();
       assert.equal(item.step, null);
       assert.ok(item.tool);
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,site) VALUES($1,'tool_complete','apps','Gmail'),($1,'tool_complete','files','Local files')",
+        [chat],
+      );
+      const recentActions = (await live()).recent;
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Used a connected app' && entry.site === 'Gmail',
+        ),
+      );
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Handled local files' && entry.site === 'Local files',
+        ),
+      );
+      const mainRun = randomUUID();
+      const helperRun = randomUUID();
+      const recentCall = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking the synthetic report',$2)",
+        [chat, mainRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking a separate helper source',$2)",
+        [chat, helperRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_start','read',$2,$3)",
+        [chat, mainRun, recentCall],
+      );
+      const completed = await pool.query<{ id: string }>(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_complete','read',$2,$3) RETURNING id",
+        [chat, mainRun, recentCall],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_failed','Synthetic failed operation'),($1,'tool_complete','set status')",
+        [chat],
+      );
+      item = await live();
+      assert.equal(item.recent?.length, 4);
+      assert.deepEqual(item.recent?.[0], {
+        id: completed.rows[0]!.id,
+        summary: 'Checking the synthetic report',
+        site: null,
+      });
+      assert.equal(
+        item.recent?.some((entry) => entry.summary.includes('failed')),
+        false,
+      );
+      assert.equal(
+        item.recent?.some((entry) => entry.summary === 'set status'),
+        false,
+      );
       const taskSession = randomUUID();
       const taskTurn = randomUUID();
       const observerTurn = randomUUID();
@@ -12419,7 +12876,110 @@ test(
         items.some((entry) => entry.turnId === observerTurn),
         false,
       );
+      const foreignThread = randomUUID();
+      const foreignTurn = randomUUID();
+      await pool.query("INSERT INTO threads(id,owner_id) VALUES($1,'other-activity-owner')", [
+        foreignThread,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,'other-activity-owner',$2,$2,'user','running',now())",
+        [foreignTurn, foreignThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_complete','Synthetic task operation'),($2,'tool_complete','Synthetic foreign operation')",
+        [taskTurn, foreignTurn],
+      );
+      const scoped = await activity.read();
+      assert.equal(
+        scoped.some((entry) => entry.turnId === foreignTurn),
+        false,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === chat)?.recent?.[0]?.id,
+        completed.rows[0]!.id,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === taskTurn)?.recent?.[0]?.summary,
+        'Synthetic task operation',
+      );
     } finally {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  'the desktop is told the owner has work running for any running turn, and rechecks until it ends',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async () => {
+    const schema = `test_working_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = new pg.Pool({ connectionString: url.href });
+    const { createActivity } = await import('../src/server/activity.ts');
+    const { refresh } = await import('../src/server/events.ts');
+    const owner = 'working-fixture-owner';
+    const seen: boolean[] = [];
+    const activity = createActivity({
+      pool,
+      ownerId: owner,
+      keepAwake: { set: (working) => seen.push(working) },
+      recheckMs: 50,
+    });
+    const until = async (count: number) => {
+      for (let attempt = 0; attempt < 200 && seen.length < count; attempt++) await delay(10);
+    };
+    try {
+      await pool.query(`CREATE TABLE threads(id uuid PRIMARY KEY, owner_id text NOT NULL, archived_at timestamptz);
+        CREATE TABLE turns(id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid, session_id uuid, source text,
+          status text, channel text DEFAULT 'web', message_id uuid, created_at timestamptz DEFAULT now(), started_at timestamptz);
+        CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
+          message_id uuid, created_at timestamptz DEFAULT now());
+        CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+        CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
+      const threadId = randomUUID();
+      const scheduled = randomUUID();
+      await pool.query('INSERT INTO threads(id,owner_id,archived_at) VALUES($1,$2,now())', [
+        threadId,
+        owner,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status) VALUES($1,'another-owner',$1,$1,'user','running'),($2,$3,$4,$2,'user','queued')",
+        [randomUUID(), randomUUID(), owner, threadId],
+      );
+      activity.start();
+      refresh();
+      await delay(400);
+      assert.deepEqual(seen, []);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$1,'schedule','running',now())",
+        [scheduled, owner, threadId],
+      );
+      assert.deepEqual(await activity.read(), []);
+      refresh();
+      await until(1);
+      assert.deepEqual(seen, [true]);
+      await pool.query('ALTER TABLE turns RENAME TO turns_unavailable');
+      await until(2);
+      assert.deepEqual(seen, [true, false]);
+      await pool.query('ALTER TABLE turns_unavailable RENAME TO turns');
+      await until(3);
+      assert.deepEqual(seen, [true, false, true]);
+      await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [scheduled]);
+      await until(4);
+      assert.deepEqual(seen, [true, false, true, false]);
+      activity.close();
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [scheduled]);
+      refresh();
+      await delay(400);
+      assert.deepEqual(seen, [true, false, true, false]);
+    } finally {
+      activity.close();
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();

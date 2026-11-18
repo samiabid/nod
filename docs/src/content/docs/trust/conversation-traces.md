@@ -41,6 +41,8 @@ Each trace includes the Nod version as `app_version` metadata when a valid relea
 
 When available, a trace also records the observed request phase. A prepared payload does not prove that the request reached the provider. This field contains no transport headers or request content.
 
+The `request_kind` field distinguishes a one-token cache-warming request (`cache_warm`) from a regular request (`regular`). Regular requests include background checks. Neither kind proves that an owner received a useful result. Older traces without the field have an unknown kind.
+
 n8n's service sees the sending machine's IP address when it receives a trace. For a self-hosted assistant, that is the server's address. It doesn't add the address to the trace.
 
 ## What Nod removes first

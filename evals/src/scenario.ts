@@ -7,6 +7,7 @@ import type { Session } from './session.ts';
 export type Capability =
   | 'apps'
   | 'browser'
+  | 'computer-use'
   | 'vault'
   | 'files'
   | 'research'
@@ -33,6 +34,7 @@ export interface World {
   notificationRule?: string;
   rules?: string;
   apps?: AppsWorld;
+  localFiles?: Record<string, string | Buffer>;
   sites?: Record<string, Site>;
   logins?: Array<{
     label: string;

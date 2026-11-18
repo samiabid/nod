@@ -723,6 +723,10 @@ test('memory refuses card numbers and login links but keeps links with long nume
     'Amex 378282246310005',
     'Old Visa 4222222222222',
     'Old Visa 4222 2222 22222',
+    'Card 4111\n1111\n1111\n1111',
+    'Card 4111\t1111\t1111\t1111',
+    'Card 4111\r\n1111\r\n1111\r\n1111',
+    'Card 4111  1111 - 1111  1111',
     'Card 4111 1111 1111 1111 12/27',
     'Ref 7 4111 1111 1111 1111',
     'Dashboard at https://owner:example-pass@example.com/admin',
@@ -734,6 +738,45 @@ test('memory refuses card numbers and login links but keeps links with long nume
     'Order 12345678901234 arrives Friday.',
   ])
     assert.equal(unsafe(text), false, text);
+});
+
+test('owner notes keep their line breaks while model-written notes and other control characters stay out', async () => {
+  const memory = createMemoryService({
+    pool: {} as pg.Pool,
+    ownerId: 'multiline-owner',
+    store: memoryObjectStore(),
+  });
+  const added = await memory.add({ area: 'about', text: 'Line one\nLine two' });
+  await memory.importNotes({ notes: [{ area: 'routines', text: 'Garden\n- beds\n- shed' }] });
+  await memory.restate([{ area: 'about', slug: 'onboarding', text: 'Role\n\tDesigner' }]);
+  const kept = (await memory.load()).entries.map((entry) => entry.text).toSorted();
+  assert.deepEqual(kept, ['Garden\n- beds\n- shed', 'Line one\nLine two', 'Role\n\tDesigner']);
+  await memory.change(added, { text: 'Line one\nLine three' });
+  const tree = await memory.load();
+  assert.ok(tree.entries.some((entry) => entry.text === 'Line one\nLine three'));
+  assert.ok(tree.archive.some((entry) => entry.text === 'Line one\nLine two'));
+  assert.ok((await memory.context()).includes('about/line-one-line-two: Line one\n  Line three'));
+  for (const text of ['Line one\rLine two', 'Bell\u0007', 'Escape\u001b[31m'])
+    await assert.rejects(memory.add({ area: 'about', text }), text);
+  assert.deepEqual(
+    applyOps(
+      emptyTree(),
+      [
+        {
+          op: 'add',
+          area: 'about',
+          slug: 'two-lines',
+          text: 'First\nSecond',
+          m: [1],
+          quote: 'First',
+          sensitive: false,
+        },
+      ],
+      [{ id: ids[1], text: 'First\nSecond' }],
+      '2026-02-01T00:00:00.000Z',
+    ),
+    [],
+  );
 });
 
 test('repair archives expired, stale and duplicate entries, keeps distinct numbers and never deletes', () => {

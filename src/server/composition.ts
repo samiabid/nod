@@ -1,3 +1,4 @@
+import { transaction } from './transaction.ts';
 import { mkdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
@@ -14,8 +15,12 @@ import {
   apiKeyConnectionProviders,
   lightestEffort,
   modelProviderInfo,
+  modelProviderNames,
   modelProviders,
   modelSource,
+  repriceUsd,
+  type ModelIssue,
+  type ModelSelection,
 } from '../shared/models.ts';
 import type { ProductAnalytics } from '../ports/analytics.ts';
 import { createPostHogAnalytics } from '../providers/posthog/analytics.ts';
@@ -48,6 +53,8 @@ import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type { PasswordManager } from '../ports/password-manager.ts';
 import type { Trash } from '../ports/trash.ts';
 import { desktopTrash } from '../providers/trash.ts';
+import type { KeepAwake } from '../ports/keep-awake.ts';
+import { desktopKeepAwake } from '../providers/keep-awake.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { DecisionModel, ModelReview } from '../ports/decisions.ts';
 import { createDecisionModel, createOpenRouterDecisionCatalog } from '../providers/decisions.ts';
@@ -61,7 +68,7 @@ import { createN8nFeedback } from '../providers/n8n/feedback.ts';
 import { createN8nTraces } from '../providers/n8n/traces.ts';
 import { createOtlpTelemetry } from '../providers/otlp/telemetry.ts';
 import type { UsageTelemetry } from '../ports/provider-usage.ts';
-import { agentModels } from '../shared/model-defaults.ts';
+import { agentModels, defaultEffort, defaultModel } from '../shared/model-defaults.ts';
 import { createChatSdkTransport } from '../providers/chat-sdk/index.ts';
 import { createWhatsAppLinkedTransport } from '../providers/chat-sdk/whatsapp.ts';
 import { combineMessagingTransports } from '../providers/chat-sdk/combined.ts';
@@ -78,9 +85,11 @@ import {
   createDiscoveredTransport,
   ownerAddress,
   ownerFetch,
+  publicHttps,
 } from '../providers/discovered/remote.ts';
 import { createDiscoveredOAuth } from '../providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from './discovered-connections.ts';
+import { bundledApps } from './app-catalog.ts';
 import { createLocalFiles, isLocalFilesAction } from './local-files.ts';
 import { createAppGrantVault } from './vault-app-grants.ts';
 import { createDockerWorkspace } from '../providers/docker/index.ts';
@@ -142,6 +151,7 @@ import { lockProactivity } from './locks.ts';
 import { createObservationSources } from './observation-sources.ts';
 import { createTaskObservations } from './task-observations.ts';
 import type { TrustBasis } from './trust-basis.ts';
+import { validateScheduledInstructions } from './owner-instructions.ts';
 import { localArtifacts } from './artifacts.ts';
 import { memoryFileName, memoryMarkdown } from '../shared/memory-export.ts';
 import { createChannels } from './channels.ts';
@@ -189,6 +199,7 @@ import {
   createUserMessageService,
   enqueueTurn,
   initializeThreads,
+  insertBugReportDraft,
   lockThread,
   reactToAssistantMessage,
   resumeAfterConnection,
@@ -199,6 +210,7 @@ import {
   stopSignal,
   stopThreadWorkers,
   withTurnLock,
+  workOrigin,
   type TurnRef,
 } from './thread.ts';
 import type { VaultActivityReason } from '../shared/contracts.ts';
@@ -210,6 +222,7 @@ import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
 import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
 import { cachedIcons, registerLinkOpened } from './link-previews.ts';
+import { appPages } from '../shared/app-links.ts';
 export interface ApplicationAdapters {
   analytics?: ProductAnalytics;
   onboardingEmail?: OnboardingEmailDelivery;
@@ -228,6 +241,7 @@ export interface ApplicationAdapters {
   keyStore: CredentialKeyStore;
   passwordManager?: PasswordManager;
   trash?: Trash;
+  keepAwake?: KeepAwake;
   localFilesHome?: string;
   memoryCurator?: MemoryCurator;
   classificationCurator?: MemoryCurator;
@@ -247,7 +261,13 @@ export interface ApplicationAdapters {
     managed?: ReturnType<typeof managedChannelEnvironment>;
     create(environment: Record<string, string>): MessagingTransport;
   };
-  model: { provider: string; name: string; configured: boolean; reconnect?: boolean };
+  model: {
+    provider: string;
+    name: string;
+    configured: boolean;
+    reconnect?: boolean;
+    issue?: ModelIssue;
+  };
 }
 
 export function modelEnvironment(
@@ -485,7 +505,7 @@ export function createDefaultAdapters(
     },
     models,
     agent: createPiAgent({
-      resolve: () => models.resolve(),
+      resolve: (choice) => models.resolve(false, choice),
       provider,
       model,
       sessionRoot: join(dataRoot, 'sessions'),
@@ -506,6 +526,7 @@ export function createDefaultAdapters(
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
     trash: desktopMode ? desktopTrash() : undefined,
+    keepAwake: desktopMode ? desktopKeepAwake() : undefined,
     workspace:
       runtime === 'kubernetes'
         ? createKubernetesWorkspace({ namespace, workspaceRoot: join(dataRoot, 'workspaces') })
@@ -657,6 +678,8 @@ export function createDefaultAdapters(
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,
             store: createChannelSessionStore({ pool, ownerId, keyStore }),
+            onDrop: (drop) =>
+              logFailure('channel_message_dropped', null, { provider: 'whatsapp', ...drop }),
           }),
         );
       },
@@ -682,6 +705,26 @@ export function createDefaultAdapters(
   };
 }
 
+function alternativeModel(models: ApplicationAdapters['models']) {
+  const view = models?.view();
+  const other = view?.connections.find(
+    (item) =>
+      item.id !== view.selection?.connectionId &&
+      item.status === 'connected' &&
+      item.models.length > 0,
+  );
+  const choice =
+    other && (defaultModel(other.provider, other.models, other.method) ?? other.models[0]);
+  return other && choice && !models?.issue({ connectionId: other.id, modelId: choice.id })
+    ? {
+        connectionId: other.id,
+        modelId: choice.id,
+        effort: defaultEffort(other.provider, choice),
+        label: `${modelProviderNames[other.provider]} · ${choice.name}`,
+      }
+    : undefined;
+}
+
 export async function createApplication(
   adapters: ApplicationAdapters,
   options: {
@@ -693,10 +736,11 @@ export async function createApplication(
 ) {
   const diagnostics: {
     log?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failures?: Awaited<ReturnType<typeof createFeedbackLog>>;
     failure: FailureLogSink;
   } = {
     failure: (event, error, context) =>
-      diagnostics.log?.record('failure', { event, error, context }, context),
+      diagnostics.failures?.record('failure', { event, error, context }, context),
   };
   try {
     return await withFailureLog(diagnostics.failure, () =>
@@ -704,6 +748,7 @@ export async function createApplication(
     );
   } catch (error) {
     await diagnostics.log?.close().catch(() => {});
+    await diagnostics.failures?.close().catch(() => {});
     try {
       await adapters.analytics?.shutdown();
     } catch {}
@@ -722,7 +767,11 @@ async function initializeApplication(
     heartbeat?: boolean;
     runtimeReady?: Promise<void>;
   },
-  diagnostics: { log?: Awaited<ReturnType<typeof createFeedbackLog>>; failure: FailureLogSink },
+  diagnostics: {
+    log?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failures?: Awaited<ReturnType<typeof createFeedbackLog>>;
+    failure: FailureLogSink;
+  },
 ) {
   const analytics = await createAnalytics({
     provider: adapters.analytics,
@@ -857,6 +906,12 @@ async function initializeApplication(
   const onboardingCurator = adapters.onboardingCurator
     ? ledger.curator(adapters.onboardingCurator)
     : curator;
+  void adapters.models?.setSelectionCheck(() =>
+    onboardingCurator.curate(
+      { task: 'check', instructions: 'Return only {"ok":true}.', input: {}, automatic: false },
+      AbortSignal.timeout(30_000),
+    ),
+  );
   const decisions = adapters.decisions && ledger.decisions(adapters.decisions);
   const review: ModelReview = async (instructions, input, signal, question) => {
     if (question) {
@@ -871,7 +926,10 @@ async function initializeApplication(
   };
   const mailCheck = createMailCheck({ curator, decisions });
   const skillLibrary = createSkillLibrary(
-    fileURLToPath(new URL('../runtime/skills/', import.meta.url)),
+    [
+      fileURLToPath(new URL('../runtime/skills/', import.meta.url)),
+      ...[...bundledApps.values()].flatMap((app) => (app.skills ? [app.skills] : [])),
+    ],
     coreSkills,
   );
   const analyzeImages =
@@ -1045,10 +1103,59 @@ async function initializeApplication(
     memory,
     learnedSkills,
     models: adapters.models,
+    localFilesAvailable: Boolean(adapters.trash),
     consumers,
     stopConsumer: (id) => boss.offWork('scheduled-task', { id, wait: true }),
+    taskModels: {
+      list: () => tasks.ownModels(),
+      title: (id) => tasks.modelTask(id),
+      set: (client, id, model) => tasks.setModel(client ?? pool, id, model, 'agent'),
+    },
+    modelProjection: async (scope, id, model) => {
+      const models = adapters.models;
+      if (!models) return null;
+      const usage = await ledger.workUsage();
+      const spent =
+        scope === 'schedule'
+          ? usage.schedules[id!]
+          : scope === 'task'
+            ? usage.tasks[id!]
+            : usage.lanes[
+                scope === 'schedules' ? 'schedule' : scope === 'background' ? 'background' : 'chat'
+              ];
+      const last30Usd = spent ? spent.agentUsd + spent.otherUsd : 0;
+      if (!spent || last30Usd <= 0) return null;
+      const origin =
+        scope === 'schedules' || scope === 'schedule'
+          ? { kind: 'schedule' as const }
+          : scope === 'background'
+            ? { kind: 'background' as const }
+            : scope === 'task'
+              ? ((await tasks.workOf(id!)) ?? { kind: 'chat' as const })
+              : { kind: 'chat' as const };
+      const target = models.priceOf(
+        model === 'light'
+          ? (models.light() ?? models.view().selection)
+          : (model ?? models.workModel(origin).selection),
+      );
+      if (!target) return null;
+      const withChoiceUsd =
+        spent.models.length === 1 && spent.models[0] === target.modelId
+          ? last30Usd
+          : repriceUsd(spent, target.pricing);
+      return { last30Usd, withChoiceUsd };
+    },
     sessionCosts: ledger.sessionCosts,
+    sessionUsage: ledger.sessionUsage,
     recentTurnCost: ledger.recentTurnCost,
+    ...(adapters.models
+      ? {
+          validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice),
+          workPricing: (own: ModelSelection | null) => adapters.models!.pricing('schedule', own),
+          modelPaused: (model: ModelSelection | null) =>
+            adapters.models!.paused({ kind: 'schedule', schedule: model }),
+        }
+      : {}),
     watchable: async (connectionIds) => integrations.watchable(connectionIds),
     watchState: async (connectionIds) => integrations.watchState(connectionIds),
   });
@@ -1059,12 +1166,61 @@ async function initializeApplication(
     analytics: captureAnalytics,
     refresh,
     clearBrowser: (id) => adapters.computer.clear(id),
+    ...(adapters.models
+      ? { validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice) }
+      : {}),
   });
   await tasks.initialize();
+  async function describeModelChoice(input: Record<string, unknown>) {
+    const models = adapters.models;
+    if (!models) return undefined;
+    const view = models.view();
+    const scope = String(input.scope ?? 'chat');
+    const id = typeof input.id === 'string' ? input.id : undefined;
+    const lane = scope === 'schedules' || scope === 'schedule' ? 'schedule' : 'background';
+    const choice =
+      input.use === 'light'
+        ? (view.light ?? view.selection)
+        : input.use === 'same'
+          ? scope === 'schedule' || scope === 'task'
+            ? models.workModel(
+                scope === 'task' && id
+                  ? ((await tasks.workOf(id)) ?? { kind: 'chat' })
+                  : { kind: lane },
+              ).selection
+            : view.selection
+          : { connectionId: String(input.connectionId), modelId: String(input.modelId) };
+    const connection = view.connections.find((item) => item.id === choice?.connectionId);
+    const model = connection?.models.find((item) => item.id === choice?.modelId);
+    if (!connection || !model) return undefined;
+    const work =
+      scope === 'schedule'
+        ? id
+          ? `the schedule "${(await personal.getSchedule(id)).title}"`
+          : 'the schedule being created'
+        : scope === 'task'
+          ? id
+            ? `the task "${await tasks.modelTask(id)}"`
+            : 'the task being started'
+          : {
+              chat: 'when the owner talks to Nod',
+              schedules: 'schedules without their own model',
+              background: 'work Nod starts on its own',
+            }[scope];
+    return {
+      service: modelSource(connection),
+      account: connection.label,
+      model: model.name,
+      for: work,
+      ...(input.use === 'light' ? { choice: 'the light model' } : {}),
+      ...(input.use === 'same' ? { choice: 'back to the default' } : {}),
+    };
+  }
   const activity = createActivity({
     pool,
     ownerId,
     model: () => adapters.models?.current.label,
+    keepAwake: adapters.keepAwake,
   });
   const observedSource = (catalog: ObservationSource[], id: string) =>
     catalog.find((source) => source.id === id) ??
@@ -1092,27 +1248,8 @@ async function initializeApplication(
     ownerId,
     keyStore: adapters.keyStore,
   });
-  const discovered = await createDiscoveredConnections(pool, {
-    analytics: captureAnalytics,
-    analyticsConsent,
-    ownerId,
-    baseUrl: publicOrigin,
-    grantVault,
-    transport: createDiscoveredTransport(),
-    oauth: createDiscoveredOAuth(),
-    local: (origin) => {
-      const fetch = ownerFetch(origin);
-      const check = ownerAddress(origin);
-      return {
-        transport: createDiscoveredTransport(fetch, async (endpoint) => {
-          const { url } = await check(endpoint);
-          if (url.hash || url.search) throw new Error('Use an address without a query.');
-          return url.href;
-        }),
-        oauth: createDiscoveredOAuth(fetch, async (link) => (await check(link)).url.href),
-      };
-    },
-    runCli: workspace.connectedCliAvailable
+  const runConnectedCli: Parameters<typeof createDiscoveredConnections>[1]['runCli'] =
+    workspace.connectedCliAvailable
       ? async (threadId, cli, args, environment, timeoutSeconds, signal) => {
           const session = workspace.open({
             threadId,
@@ -1122,6 +1259,41 @@ async function initializeApplication(
           if (!session.runConnectedCli) throw new Error('Connected CLI commands are unavailable.');
           return session.runConnectedCli(cli, args, environment, timeoutSeconds);
         }
+      : undefined;
+  const discovered = await createDiscoveredConnections(pool, {
+    analytics: captureAnalytics,
+    analyticsConsent,
+    ownerId,
+    baseUrl: publicOrigin,
+    grantVault,
+    transport: createDiscoveredTransport(),
+    oauth: createDiscoveredOAuth(),
+    local: (origin) => {
+      const check = ownerAddress(origin);
+      const signIn = ownerAddress(origin, publicHttps);
+      return {
+        transport: createDiscoveredTransport(ownerFetch(origin), async (endpoint) => {
+          const { url } = await check(endpoint);
+          if (url.hash || url.search) throw new Error('Use an address without a query.');
+          return url.href;
+        }),
+        oauth: createDiscoveredOAuth(
+          ownerFetch(origin, publicHttps),
+          async (link) => (await signIn(link)).url.href,
+        ),
+      };
+    },
+    runCli: runConnectedCli,
+    verifyCli: runConnectedCli
+      ? async (cli, args, environment, timeoutSeconds, signal) =>
+          runConnectedCli(
+            (await activeThread(pool, ownerId)).id,
+            cli,
+            args,
+            environment,
+            timeoutSeconds,
+            signal,
+          )
       : undefined,
     resumeConnection: resumeAfterConnection,
     refresh,
@@ -1138,17 +1310,26 @@ async function initializeApplication(
     trash: adapters.trash,
     available: Boolean(adapters.trash),
   });
-  const preparationPaused = async () => {
+  const preparationBlocked = async () => {
+    if ((await ledger.preparationLimit()).reached)
+      return 'the monthly preparation allowance is reached';
+    const unpriced = adapters.models?.unpricedPreparationModel();
+    if (unpriced) return `${unpriced} has no price, so the preparation allowance cannot bound it`;
+  };
+  const preparationPause = async () => {
     const prefs = await speechPreferences.get();
-    return prefs.proactivePaused || isQuietTime(prefs) || (await ledger.preparationLimit()).reached;
+    if (prefs.proactivePaused) return 'automatic preparation is paused';
+    if (isQuietTime(prefs)) return 'it is quiet hours';
+    return preparationBlocked();
   };
   const integrations = await createIntegrations(pool, {
     localFiles,
     mailCheck: async (...args) => {
-      if (await preparationPaused()) return args[0].map(() => undefined);
+      const pause = await preparationPause();
+      if (pause) return args[0].map(() => `background email checks wait because ${pause}`);
       return ledger.withPreparation(randomUUID(), () => mailCheck(...args));
     },
-    paused: preparationPaused,
+    paused: async () => Boolean(await preparationPause()),
     analytics: captureAnalytics,
     analyticsConsent,
     admission,
@@ -1324,6 +1505,14 @@ async function initializeApplication(
       throw error;
     }
   };
+  let feedbackDrafts: Awaited<ReturnType<typeof registerFeedback>> | undefined;
+  const readyDrafts = () => {
+    if (!feedbackDrafts)
+      throw Object.assign(new Error('Bug reports are still starting. Try again in a moment.'), {
+        notRun: true,
+      });
+    return feedbackDrafts;
+  };
   const approvals = await createApprovals(
     async (action, args, provenance) => {
       if (
@@ -1359,168 +1548,201 @@ async function initializeApplication(
         ? replayBrowserStep(args, provenance)
         : action === 'NOD_vault_allow'
           ? vaultAccess.allow(args)
-          : action === 'NOD_limits_update'
-            ? withTurnLock(turnLock, (client) => ledger.setLimits(args, 'agent', client))
-            : scheduleWrite
-              ? withTurnLock(turnLock, (client) =>
-                  personal.manage(action.slice('NOD_'.length), args, provenance, { client }),
-                )
-              : lockedWrite
-                ? withTurnLock(turnLock, (client) =>
-                    personal.manage(action.slice('NOD_'.length), args, provenance, {
-                      client,
-                      ...(provenance.details?.currentRules === undefined
-                        ? {}
-                        : { expectedRules: String(provenance.details.currentRules) }),
-                    }),
+          : action === 'NOD_bug_report_send'
+            ? readyDrafts().sendDraft(
+                String(args.draftId),
+                null,
+                () => provenance.signal?.aborted === true,
+              )
+            : action === 'NOD_limits_update'
+              ? withTurnLock(turnLock, (client) => ledger.setLimits(args, 'agent', client))
+              : scheduleWrite
+                ? transaction(
+                    async (client) => {
+                      if ((await lockThread(client)).id !== provenance.threadId)
+                        throw Object.assign(
+                          new Error('The instruction conversation is no longer active.'),
+                          { notRun: true },
+                        );
+                      return withTurnLock(
+                        turnLock,
+                        (locked) =>
+                          personal.manage(action.slice('NOD_'.length), args, provenance, {
+                            client: locked,
+                          }),
+                        client,
+                      );
+                    },
+                    pool,
+                    provenance.signal,
                   )
-                : action.startsWith('NOD_')
-                  ? personal.manage(action.slice('NOD_'.length), args, provenance)
-                  : (async () => {
-                      const savedBinding = provenance.details?.verifiedBinding;
-                      const verifiedBinding =
-                        typeof savedBinding === 'string' ? savedBinding : undefined;
-                      if (action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT') {
-                        const currentBinding = await integrations
-                          .binding(String(args.connectionId ?? ''))
-                          .catch((error: unknown) => {
-                            throw Object.assign(
-                              new Error(
-                                `Nod could not check the selected Gmail account for deletion: ${safeIntegrationFailure(error)}`,
+                : lockedWrite
+                  ? withTurnLock(turnLock, (client) =>
+                      personal.manage(action.slice('NOD_'.length), args, provenance, {
+                        client,
+                        ...(provenance.details?.currentNotificationRule === undefined
+                          ? {}
+                          : {
+                              expectedNotificationRule: String(
+                                provenance.details.currentNotificationRule,
                               ),
+                            }),
+                        ...(provenance.details?.currentRules === undefined
+                          ? {}
+                          : { expectedRules: String(provenance.details.currentRules) }),
+                      }),
+                    )
+                  : action.startsWith('NOD_')
+                    ? personal.manage(action.slice('NOD_'.length), args, provenance)
+                    : (async () => {
+                        integrations.serviceWait('action', action);
+                        const savedBinding = provenance.details?.verifiedBinding;
+                        const verifiedBinding =
+                          typeof savedBinding === 'string' ? savedBinding : undefined;
+                        if (action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT') {
+                          const currentBinding = await integrations
+                            .binding(String(args.connectionId ?? ''))
+                            .catch((error: unknown) => {
+                              throw Object.assign(
+                                new Error(
+                                  `Nod could not check the selected Gmail account for deletion: ${safeIntegrationFailure(error)}`,
+                                ),
+                                { notRun: true },
+                              );
+                            });
+                          if (!verifiedBinding || currentBinding !== verifiedBinding)
+                            throw Object.assign(
+                              new Error('The selected Gmail account changed after confirmation.'),
                               { notRun: true },
                             );
-                          });
-                        if (!verifiedBinding || currentBinding !== verifiedBinding)
-                          throw Object.assign(
-                            new Error('The selected Gmail account changed after confirmation.'),
-                            { notRun: true },
-                          );
-                        if (action === 'GMAIL_DELETE_DRAFT') {
-                          const draftId = args.draft_id;
-                          const savedMessageId = provenance.details?.verifiedDraftMessageId;
-                          if (
-                            typeof draftId !== 'string' ||
-                            !draftId.trim() ||
-                            typeof savedMessageId !== 'string' ||
-                            !savedMessageId.trim()
-                          )
-                            throw Object.assign(
-                              new Error(
-                                'The Gmail draft confirmation is missing its verified target.',
-                              ),
-                              { notRun: true },
-                            );
-                          const readArgs = {
-                            connectionId: args.connectionId,
-                            draft_id: draftId,
-                            format: 'metadata',
-                            ...(typeof args.user_id === 'string' ? { user_id: args.user_id } : {}),
-                          };
-                          const readVerdict = await trust
-                            .check(
-                              { threadId: provenance.threadId, turnId: provenance.turnId },
-                              'GMAIL_GET_DRAFT',
-                              readArgs,
-                              provenance.signal,
+                          if (action === 'GMAIL_DELETE_DRAFT') {
+                            const draftId = args.draft_id;
+                            const savedMessageId = provenance.details?.verifiedDraftMessageId;
+                            if (
+                              typeof draftId !== 'string' ||
+                              !draftId.trim() ||
+                              typeof savedMessageId !== 'string' ||
+                              !savedMessageId.trim()
                             )
-                            .catch((error: unknown) => {
                               throw Object.assign(
                                 new Error(
-                                  `Nod could not recheck permission to read the Gmail draft before deletion: ${safeIntegrationFailure(error)}`,
+                                  'The Gmail draft confirmation is missing its verified target.',
                                 ),
                                 { notRun: true },
                               );
-                            });
-                          if (readVerdict.confirm)
-                            throw Object.assign(
-                              new Error(
-                                'Nod could not authorize a fresh Gmail draft read before deletion.',
-                              ),
-                              { notRun: true },
-                            );
-                          const current = await integrations
-                            .execute(
-                              ownerId,
-                              'GMAIL_GET_DRAFT',
-                              readArgs,
-                              { threadId: provenance.threadId, turnId: provenance.turnId },
-                              provenance.signal,
-                              verifiedBinding,
-                            )
-                            .catch((error: unknown) => {
+                            const readArgs = {
+                              connectionId: args.connectionId,
+                              draft_id: draftId,
+                              format: 'metadata',
+                              ...(typeof args.user_id === 'string'
+                                ? { user_id: args.user_id }
+                                : {}),
+                            };
+                            const readVerdict = await trust
+                              .check(
+                                { threadId: provenance.threadId, turnId: provenance.turnId },
+                                'GMAIL_GET_DRAFT',
+                                readArgs,
+                                provenance.signal,
+                              )
+                              .catch((error: unknown) => {
+                                throw Object.assign(
+                                  new Error(
+                                    `Nod could not recheck permission to read the Gmail draft before deletion: ${safeIntegrationFailure(error)}`,
+                                  ),
+                                  { notRun: true },
+                                );
+                              });
+                            if (readVerdict.confirm)
                               throw Object.assign(
                                 new Error(
-                                  `Nod could not recheck the Gmail draft before deletion: ${safeIntegrationFailure(error)}`,
+                                  'Nod could not authorize a fresh Gmail draft read before deletion.',
                                 ),
                                 { notRun: true },
                               );
-                            });
-                          await ledger
-                            .action(provenance.turnId, 'GMAIL_GET_DRAFT', readVerdict.basis)
-                            .catch((error: unknown) => {
+                            const current = await integrations
+                              .execute(
+                                ownerId,
+                                'GMAIL_GET_DRAFT',
+                                readArgs,
+                                { threadId: provenance.threadId, turnId: provenance.turnId },
+                                provenance.signal,
+                                verifiedBinding,
+                                'read',
+                              )
+                              .catch((error: unknown) => {
+                                throw Object.assign(
+                                  new Error(
+                                    `Nod could not recheck the Gmail draft before deletion: ${safeIntegrationFailure(error)}`,
+                                  ),
+                                  { notRun: true },
+                                );
+                              });
+                            await ledger
+                              .action(provenance.turnId, 'GMAIL_GET_DRAFT', readVerdict.basis)
+                              .catch((error: unknown) => {
+                                throw Object.assign(
+                                  new Error(
+                                    `Nod could not record the Gmail draft read before deletion: ${safeIntegrationFailure(error)}`,
+                                  ),
+                                  { notRun: true },
+                                );
+                              });
+                            const currentTarget = gmailDraftTarget(current, draftId);
+                            if (!currentTarget)
                               throw Object.assign(
                                 new Error(
-                                  `Nod could not record the Gmail draft read before deletion: ${safeIntegrationFailure(error)}`,
+                                  'Nod could not verify the Gmail draft before deletion. Ask again before deleting it.',
                                 ),
                                 { notRun: true },
                               );
-                            });
-                          const currentTarget = gmailDraftTarget(current, draftId);
-                          if (!currentTarget)
-                            throw Object.assign(
-                              new Error(
-                                'Nod could not verify the Gmail draft before deletion. Ask again before deleting it.',
-                              ),
-                              { notRun: true },
-                            );
-                          if (currentTarget.messageId !== savedMessageId)
-                            throw Object.assign(
-                              new Error(
-                                'The Gmail draft changed after confirmation. Ask again before deleting it.',
-                              ),
-                              { notRun: true },
-                            );
+                            if (currentTarget.messageId !== savedMessageId)
+                              throw Object.assign(
+                                new Error(
+                                  'The Gmail draft changed after confirmation. Ask again before deleting it.',
+                                ),
+                                { notRun: true },
+                              );
+                          }
                         }
-                      }
-                      const turn = { threadId: provenance.threadId, turnId: provenance.turnId };
-                      const ready = hasWorkspaceFiles(args)
-                        ? await integrations
-                            .prepare(ownerId, action, args, turn, provenance.signal)
-                            .catch((error: unknown) => {
-                              throw Object.assign(
-                                error instanceof Error ? error : new Error(String(error)),
-                                { notRun: true },
-                              );
+                        const turn = { threadId: provenance.threadId, turnId: provenance.turnId };
+                        const ready = hasWorkspaceFiles(args)
+                          ? await integrations
+                              .prepare(ownerId, action, args, turn, provenance.signal)
+                              .catch((error: unknown) => {
+                                throw Object.assign(
+                                  error instanceof Error ? error : new Error(String(error)),
+                                  { notRun: true },
+                                );
+                              })
+                          : args;
+                        const result = await integrations.executeApproved(
+                          ownerId,
+                          action,
+                          ready,
+                          turn,
+                          provenance.signal,
+                          action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT'
+                            ? verifiedBinding
+                            : undefined,
+                        );
+                        await ledger.action(
+                          provenance.turnId,
+                          action,
+                          provenance.basis ?? { kind: 'approved' },
+                          actionTarget(action, args, provenance.details),
+                        );
+                        return privateEmailResult(
+                          (
+                            await saveIntegrationFiles(result, async (file) => {
+                              const name = `${randomUUID()}-${basename(file.name)}`;
+                              await workspace.writeArtifact(provenance.threadId, name, file.bytes);
+                              return name;
                             })
-                        : args;
-                      const result = await integrations.executeApproved(
-                        ownerId,
-                        action,
-                        ready,
-                        turn,
-                        provenance.signal,
-                        action === 'GMAIL_DELETE_MESSAGE' || action === 'GMAIL_DELETE_DRAFT'
-                          ? verifiedBinding
-                          : undefined,
-                      );
-                      await ledger.action(
-                        provenance.turnId,
-                        action,
-                        provenance.basis ?? { kind: 'approved' },
-                        actionTarget(action, args, provenance.details),
-                      );
-                      return privateEmailResult(
-                        (
-                          await saveIntegrationFiles(result, async (file) => {
-                            const name = `${randomUUID()}-${basename(file.name)}`;
-                            await workspace.writeArtifact(provenance.threadId, name, file.bytes);
-                            return name;
-                          })
-                        ).value,
-                        mailCheck,
-                      );
-                    })());
+                          ).value,
+                          mailCheck,
+                        );
+                      })());
       if (action.startsWith('NOD_') && action !== 'NOD_vault_allow')
         await ledger.action(
           provenance.turnId,
@@ -1531,7 +1753,7 @@ async function initializeApplication(
       return result;
     },
     async (action, args, expectedRevision, client) => {
-      if (['NOD_browser', 'NOD_vault_allow'].includes(action)) return;
+      if (['NOD_browser', 'NOD_vault_allow', 'NOD_bug_report_send'].includes(action)) return;
       if (action === 'NOD_limits_update') limitsInput.parse(args);
       else if (action.startsWith('NOD_')) {
         if (
@@ -1544,7 +1766,7 @@ async function initializeApplication(
         await personal.validateReview(action.slice('NOD_'.length), args, expectedRevision, client);
       } else await integrations.prepare(ownerId, action, args, undefined, undefined, false, client);
     },
-    (reply) => trust.answer(reply),
+    (reply) => ledger.forOwner(() => trust.answer(reply)),
     communication.describe,
     captureAnalytics,
   );
@@ -1598,6 +1820,8 @@ async function initializeApplication(
         { connectionId: account.connectionId, query },
         undefined,
         signal,
+        undefined,
+        'background',
       );
     },
     read: async (
@@ -1607,6 +1831,7 @@ async function initializeApplication(
       signal: AbortSignal,
     ) => {
       signal.throwIfAborted();
+      integrations.serviceWait('background', tool.action);
       if (
         (await integrations.binding(account.connectionId)) !== account.binding ||
         !(await trust.readOnly(
@@ -1622,7 +1847,15 @@ async function initializeApplication(
       signal.throwIfAborted();
       if ((await integrations.binding(account.connectionId)) !== account.binding)
         throw new Error('This connected account changed.');
-      return integrations.execute(ownerId, tool.action, args, undefined, signal, account.binding);
+      return integrations.execute(
+        ownerId,
+        tool.action,
+        args,
+        undefined,
+        signal,
+        account.binding,
+        'background',
+      );
     },
     current: async (accounts: AppAccount[], client?: import('pg').PoolClient) => {
       for (const account of accounts)
@@ -1687,29 +1920,32 @@ async function initializeApplication(
       }
     | undefined;
   const feedbackSecrets = [ownerId, ...secrets];
-  diagnostics.log = await createFeedbackLog({
+  const sanitizeDiagnostics = async (value: unknown) => {
+    const profile = await (feedbackProfileRead ??= ownerProfile().finally(() => {
+      feedbackProfileRead = undefined;
+    }));
+    for (let index = feedbackSecrets.length - 1; index < secrets.length; index++)
+      feedbackSecrets.push(secrets[index]);
+    if (
+      !feedbackRedaction ||
+      feedbackRedaction.profile.region !== profile.region ||
+      feedbackRedaction.profile.names.length !== profile.names.length ||
+      feedbackRedaction.profile.names.some((name, index) => name !== profile.names[index])
+    )
+      feedbackRedaction = {
+        profile,
+        redact: createFeedbackRedactor({ secrets: feedbackSecrets, profile }),
+      };
+    const { redact } = feedbackRedaction;
+    if (!redact.isReady()) throw new Error('Diagnostic redaction unavailable.');
+    return redact.value(value);
+  };
+  diagnostics.log = await createFeedbackLog({ dataRoot, ownerId, sanitize: sanitizeDiagnostics });
+  diagnostics.failures = await createFeedbackLog({
     dataRoot,
     ownerId,
-    sanitize: async (value) => {
-      const profile = await (feedbackProfileRead ??= ownerProfile().finally(() => {
-        feedbackProfileRead = undefined;
-      }));
-      for (let index = feedbackSecrets.length - 1; index < secrets.length; index++)
-        feedbackSecrets.push(secrets[index]);
-      if (
-        !feedbackRedaction ||
-        feedbackRedaction.profile.region !== profile.region ||
-        feedbackRedaction.profile.names.length !== profile.names.length ||
-        feedbackRedaction.profile.names.some((name, index) => name !== profile.names[index])
-      )
-        feedbackRedaction = {
-          profile,
-          redact: createFeedbackRedactor({ secrets: feedbackSecrets, profile }),
-        };
-      const { redact } = feedbackRedaction;
-      if (!redact.isReady()) throw new Error('Diagnostic redaction unavailable.');
-      return redact.value(value);
-    },
+    name: 'failures',
+    sanitize: sanitizeDiagnostics,
   });
   adapters.traces?.configure({
     enabled: (await localAccounts.read(ownerId)).traces,
@@ -1819,9 +2055,9 @@ async function initializeApplication(
     curator: adapters.classificationCurator && ledger.curator(adapters.classificationCurator),
     analytics: captureAnalytics,
     modelAvailable: async () =>
-      !(await ledger.preparationLimit()).reached &&
+      !(await preparationBlocked()) &&
       (adapters.models
-        ? await adapters.models.automaticRequestsAllowed()
+        ? await adapters.models.automaticRequestsAllowed({ kind: 'background' }, true)
         : adapters.model.configured),
     redact: createTextRedactor(secrets),
     sources: (client) => observations.sources(client),
@@ -1933,6 +2169,23 @@ async function initializeApplication(
       taskChecks: tasks.resumeDue,
       analytics: captureAnalytics,
       currentModel: () => adapters.model,
+      ...(adapters.models
+        ? {
+            workModel: async (turnId: string) => {
+              const origin = await workOrigin(turnId);
+              if (!origin) return undefined;
+              const { selection } = adapters.models!.workModel(origin);
+              const { provider, name } = adapters.models!.describe(selection);
+              return { selection, provider, name };
+            },
+          }
+        : {}),
+      modelAlternative: () => {
+        const other = alternativeModel(adapters.models);
+        return other
+          ? `Your ${other.label} connection is also set up: you can switch to it in ${appPages['/settings/models']}.`
+          : undefined;
+      },
       taskClassification: true,
       observeTurn: (turnId, operation) =>
         analytics
@@ -1982,7 +2235,7 @@ async function initializeApplication(
                 .runTurn({ ...context, runtimeHost: desktopMode ? 'desktop' : 'server' })
                 .finally(() => proactivity.release(context.turnId)),
             Boolean(context.spendingLimitReached),
-            !context.currentMessageId,
+            Boolean(context.automatic),
           );
         return automaticWork ? ledger.withPreparation(context.turnId, run) : run();
       },
@@ -2000,8 +2253,47 @@ async function initializeApplication(
       taskContext: tasks.context,
       settleTask: tasks.settle,
       taskLedger: tasks.read,
-      task: tasks.execute,
-      startTurn: tasks.inherit,
+      task: async (turn, raw, sourceMessageId, priorMessageId, priorHandoff) => {
+        const request = raw as { action?: unknown; model?: unknown } | undefined;
+        if (request?.action === 'start' && request.model) {
+          const current = (
+            await pool.query<{ proactive: boolean; chat: boolean }>(
+              'SELECT proactive,session_id=thread_id AS chat FROM turns WHERE id=$1 AND owner_id=$2',
+              [turn.turnId, ownerId],
+            )
+          ).rows[0];
+          if (!current?.chat || current.proactive)
+            throw new Error('Only a task the owner starts from chat can have its own model.');
+          const choice = await personal.validateReview('model_select', {
+            scope: 'chat',
+            ...(request.model as Record<string, unknown>),
+          });
+          const verdict = await trust.check(turn, 'NOD_model_select', {
+            ...choice,
+            scope: 'task',
+            targetModel: await describeModelChoice({ ...choice, scope: 'task' }),
+          });
+          if (verdict.confirm)
+            throw new Error(
+              'The owner did not ask for a model for this task. Start it without model, or ask the owner first.',
+            );
+          const { connectionId, modelId, effort } = choice as Record<string, unknown>;
+          return tasks.execute(
+            turn,
+            { ...(raw as object), model: { connectionId, modelId, effort } },
+            sourceMessageId,
+            priorMessageId,
+            priorHandoff,
+          );
+        }
+        return tasks.execute(turn, raw, sourceMessageId, priorMessageId, priorHandoff);
+      },
+      startTurn: async (turn) => {
+        const origin = await turnOrigin(turn.turnId);
+        if (origin?.source === 'schedule')
+          await validateScheduledInstructions(pool, ownerId, origin.scheduleInstruction);
+        await tasks.inherit(turn);
+      },
       connections: async (...args) => {
         const result = await integrations.manageConnections(...args);
         if (!('url' in result) || !('name' in result) || typeof result.name !== 'string')
@@ -2136,6 +2428,36 @@ async function initializeApplication(
           const { id, state, snoozedUntil, feedback } = await proactivity.control(args, turn);
           return { id, state, snoozedUntil, feedback };
         }
+        if (action === 'bug_report_draft' || action === 'bug_report_send') {
+          if (!readyDrafts().configured)
+            return 'Bug reports cannot be sent from this Nod. Describe the problem in your reply instead.';
+        }
+        if (action === 'bug_report_draft') {
+          const { summary } = z.object({ summary: z.string().trim().min(1).max(4000) }).parse(args);
+          await withTurnLock(turn.turnId, (client) =>
+            insertBugReportDraft(client, turn, '', summary),
+          );
+          refresh();
+          return 'The owner now sees this bug report with a Send report button, or can reply "send" in a chat app. Do not repeat the summary.';
+        }
+        if (action === 'bug_report_send') {
+          const draft = await readyDrafts().draftFor(turn.threadId, provenance.sourceMessageId);
+          if (!draft)
+            throw new Error(
+              'No unsent bug report is waiting in this conversation. Draft one with bug_report_draft first.',
+            );
+          if (draft.sent) return { status: 'already_sent', receipt: draft.sent };
+          const input = { draftId: draft.id, summary: draft.summary };
+          const verdict = await trust.check(turn, 'NOD_bug_report_send', input);
+          return approvals.request(turn, 'NOD_bug_report_send', input, {
+            ...provenance,
+            allowed: !verdict.confirm,
+            ...(verdict.confirm ? {} : { basis: verdict.basis }),
+            expectedChatRevision: verdict.chatRevision,
+            admit,
+            details: verdict.confirm ? { reason: verdict.reason } : {},
+          });
+        }
         if (action === 'limits_update') {
           const input = limitsInput.parse(args);
           const verdict = await trust.check(turn, 'NOD_limits_update', input);
@@ -2167,61 +2489,59 @@ async function initializeApplication(
             throw new Error(
               'A scheduled run cannot create schedules. Do the work this schedule asks for in this run instead.',
             );
-          const input = await personal.validateReview(action, args);
-          const schedule =
-            action === 'schedule_pause' || action === 'schedule_update'
-              ? await personal.getSchedule(String(input.id))
-              : undefined;
-          if (action === 'schedule_pause' && schedule && !schedule.enabled) return schedule;
-          const current = schedule
-            ? {
-                title: schedule.title,
-                prompt: schedule.prompt,
-                cron: schedule.cron,
-                runAt: schedule.runAt,
-                timeZone: schedule.timeZone,
-              }
+          const prepared = action.startsWith('schedule_')
+            ? await personal.prepareScheduleChange(action, args)
             : undefined;
+          const input: Record<string, unknown> =
+            prepared?.input ?? (await personal.validateReview(action, args));
+          const current = prepared?.before ?? undefined;
+          if (action === 'schedule_pause' && current?.enabled === false)
+            return personal.getSchedule(String(input.id));
           const preferences =
             action === 'notification_preferences_update'
               ? await triage.getPreferences()
               : undefined;
           const rule = 'notificationRule' in input ? preferences?.notificationRule : undefined;
           const rules = 'rules' in input ? preferences?.rules : undefined;
-          const connection =
+          const targetModel =
             action === 'model_select'
-              ? adapters.models?.view().connections.find((item) => item.id === input.connectionId)
-              : undefined;
-          const targetModel = connection
-            ? {
-                service: modelSource(connection),
-                account: connection.label,
-                model: connection.models.find((item) => item.id === input.modelId)!.name,
-              }
-            : undefined;
-          const verdict = await trust.check(turn, `NOD_${action}`, {
-            ...input,
-            ...(targetModel ? { targetModel } : {}),
-            ...(current ? { currentSchedule: current } : {}),
-            ...(rule === undefined ? {} : { currentNotificationRule: rule }),
-            ...(rules === undefined ? {} : { currentRules: rules }),
-          });
+              ? await describeModelChoice(input)
+              : action === 'schedule_create' && input.model
+                ? await describeModelChoice({
+                    scope: 'schedule',
+                    ...(input.model as ModelSelection),
+                  })
+                : undefined;
+          const verdict = await trust.check(
+            turn,
+            `NOD_${action}`,
+            {
+              ...input,
+              ...(targetModel ? { targetModel } : {}),
+              ...(current ? { currentSchedule: current } : {}),
+              ...(rule === undefined ? {} : { currentNotificationRule: rule }),
+              ...(rules === undefined ? {} : { currentRules: rules }),
+            },
+            undefined,
+            prepared,
+          );
           return approvals.request(turn, `NOD_${action}`, input, {
             ...provenance,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
             expectedChatRevision: verdict.chatRevision,
             admit,
-            expectedRevision: schedule?.revision,
-            validate: schedule
+            instructionChange: verdict.instructionChange,
+            expectedRevision: prepared?.revision,
+            validate: prepared?.before
               ? async (client) => {
                   const current = (
                     await client.query(
                       'SELECT revision FROM schedules WHERE id=$1 AND owner_id=$2 FOR SHARE',
-                      [schedule.id, ownerId],
+                      [input.id, ownerId],
                     )
                   ).rows[0];
-                  if (current?.revision !== schedule.revision)
+                  if (current?.revision !== prepared.revision)
                     throw Object.assign(
                       new Error('The schedule changed. Review it before asking again.'),
                       { statusCode: 409 },
@@ -2384,10 +2704,36 @@ async function initializeApplication(
             keptOut: await localFiles.keepOut(turn, String(args.path ?? ''), client),
           }));
         }
+        const readWork = (await turnOrigin(turn.turnId))?.source === 'user' ? 'read' : 'background';
         if (action === 'SEARCH_TOOLS') {
           await options.admit?.(false);
-          const result = await integrations.execute(ownerId, action, args, turn, options.signal);
+          const result = await integrations.execute(
+            ownerId,
+            action,
+            args,
+            turn,
+            options.signal,
+            undefined,
+            readWork,
+          );
           return result;
+        }
+        if (isLocalFilesAction(action) && localFiles.available && !(await localFiles.enabled())) {
+          await localFiles.assertStartedByOwner(turn);
+          const input = { localFilesEnabled: true };
+          const verdict = await trust.check(turn, 'NOD_notification_preferences_update', input);
+          return approvals.request(turn, 'NOD_notification_preferences_update', input, {
+            allowed: !verdict.confirm,
+            ...(verdict.confirm ? {} : { basis: verdict.basis }),
+            signal: options.signal,
+            admit: options.admit,
+            expectedChatRevision: verdict.chatRevision,
+            details: {
+              ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
+              accessScope:
+                'Enable local file access in the home folder and external drives for work the owner starts. Hidden files, secrets, private system folders and kept-out folders stay blocked. This enables the setting only; the requested file action has not run.',
+            },
+          });
         }
         const prepare = () =>
           hasWorkspaceFiles(args)
@@ -2463,6 +2809,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
+              readWork,
             );
           } catch (error) {
             options.signal?.throwIfAborted();
@@ -2497,6 +2844,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
+              !verdict.confirm && verdict.basis.kind === 'read' ? readWork : 'action',
             );
             await ledger.action(
               turn.turnId,
@@ -2546,14 +2894,18 @@ async function initializeApplication(
     activity: activity.current,
     planningTasks: onboardingSuggestions.planning,
     computer,
-    configuration: () =>
-      configuration({
+    configuration: () => {
+      const alternative = alternativeModel(adapters.models);
+      return configuration({
         provider: adapters.model.provider,
         model: adapters.model.name,
         llmReady: adapters.model.configured,
         modelReconnect: adapters.model.reconnect === true,
+        ...(adapters.model.issue ? { modelIssue: adapters.model.issue } : {}),
+        ...(alternative ? { modelAlternative: alternative } : {}),
         integrationsReady: adapters.integrations.configured,
-      }),
+      });
+    },
   });
   adapters.models?.register(app, captureAnalytics);
   proactivity.registerRoutes(app);
@@ -2567,6 +2919,9 @@ async function initializeApplication(
     secrets,
     profile: ownerProfile,
     logs: () => diagnostics.log!.snapshot(),
+    failures: () => diagnostics.failures!.snapshot(),
+    dataRoot,
+    trustModel: adapters.trustModel ?? 'selected',
     context: await feedbackContext({ environment: process.env }),
     get provider() {
       return adapters.model.provider;
@@ -2575,7 +2930,7 @@ async function initializeApplication(
       return adapters.model.name;
     },
   };
-  await registerFeedback(app, {
+  feedbackDrafts = await registerFeedback(app, {
     pool,
     ownerId,
     context: feedbackReportOptions.context!,
@@ -2585,11 +2940,12 @@ async function initializeApplication(
       submit: async (input) => ({ submissionId: input.submissionId, status: 'rejected' }),
       status: async (submissionId) => ({ submissionId, status: 'rejected' }),
     },
-    buildReport: (activity, errors, errorsAvailable) =>
+    buildReport: (activity, errors, errorsAvailable, client) =>
       buildFeedbackReport({
         ...feedbackReportOptions,
         errors,
         errorsAvailable,
+        client,
         activity: [...feedbackActivity.snapshot(), ...activity].sort((a, b) => b.ageMs - a.ageMs),
       }),
     analytics: captureAnalytics,
@@ -2599,7 +2955,6 @@ async function initializeApplication(
     analytics,
     model: () => adapters.model,
     accounts: localAccounts,
-    origin: publicOrigin,
     localUser: { id: ownerId, name: 'You', email: null, avatarUrl: null },
     developerIds: desktopMode ? new Set() : new Set([ownerId]),
     start: welcome,
@@ -2698,7 +3053,8 @@ async function initializeApplication(
       ...(channelSettings ? { pair: channelSettings.pair } : {}),
       transport: messaging,
       isRetirableScheduleConfirmation: approvals.isRetirableScheduleConfirmation,
-      classifyRetiredReply: trust.classifyRetiredReply,
+      classifyRetiredReply: (reply, expired) =>
+        ledger.forOwner(() => trust.classifyRetiredReply(reply, expired)),
       acceptVerification: (text, input) => chatVerification.accept(text, input),
       reacted: (messageId, reaction) => reactToMessage(messageId, reaction),
       activeThread: (client) => lockThread(client),
@@ -2838,6 +3194,7 @@ async function initializeApplication(
       () => analytics.shutdown(),
       () => adapters.telemetry?.shutdown(),
       () => diagnostics.log?.close(),
+      () => diagnostics.failures?.close(),
     ]) {
       try {
         await close();

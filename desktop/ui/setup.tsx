@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { SetupProgress } from '../../src/web/components/setup-progress';
 import { PasswordInput } from '../../src/web/components/password-input';
-import { Welcome } from '../../src/web/pages/onboarding/steps/welcome';
+import { Welcome, WelcomeNote } from '../../src/web/pages/onboarding/steps/welcome';
 import { OnboardingFrame } from '../../src/web/pages/onboarding/frame';
 import { startupMessage, type StartupStage } from '../../src/shared/desktop-startup';
 import { initializeFocusVisibility } from '../../src/web/lib/focus';
@@ -55,7 +55,7 @@ type Desktop = {
   openConnectionSettings(): Promise<void>;
   closeConnectionSettings(): Promise<void>;
   continueOnboarding(): Promise<void>;
-  prepare(options?: { retry: boolean }): Promise<Status>;
+  prepare(options?: { retry: boolean; report?: boolean }): Promise<Status>;
   warmup?(): Promise<void>;
   installWsl(): Promise<Status>;
   showStartupLog(): Promise<void>;
@@ -416,18 +416,22 @@ function Startup() {
         <OnboardingFrame
           step={welcomeStep}
           footer={
-            <button
-              className="server-entry"
-              type="button"
-              onClick={() => void desktop?.openConnectionSettings()}
-            >
-              Connect to a server
-            </button>
+            <>
+              <button
+                className="server-entry"
+                type="button"
+                onClick={() => void desktop?.openConnectionSettings()}
+              >
+                Connect to a server
+              </button>
+              <WelcomeNote />
+            </>
           }
         >
           <div className="ob-screen" inert={busy && !handingOff} aria-busy={busy || handingOff}>
             <Welcome
               local
+              note={false}
               usageShared={welcome.usageData}
               traces={{ enabled: false, onChange: () => Promise.resolve() }}
               arrived="forward"
@@ -492,6 +496,29 @@ function Startup() {
         : active.message ||
           (firstSetup ? 'Preparing your workspace and browser.' : 'Opening your saved workspace.');
 
+  const retry = (report = false) =>
+    run(async () => {
+      if (!desktop) return;
+      if (failure?.needsServerConnection) {
+        await desktop.openConnectionSettings();
+        return;
+      }
+      if (settingsError || (firstSetup && !welcome)) {
+        const [preferences, settings] = await Promise.all([
+          desktop.getPreferences(),
+          desktop.getSettings(),
+        ]);
+        applyPreferences(preferences);
+        if (firstSetup) {
+          localChoiceSaved.current = Boolean(settings.welcome);
+          acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
+        }
+        setSettingsError('');
+      }
+      if (firstSetup && !localChoiceSaved.current) return;
+      return desktop.prepare(report ? { retry: true, report } : { retry: true });
+    });
+
   return (
     <>
       <div className="titlebar" aria-hidden="true" />
@@ -521,38 +548,18 @@ function Startup() {
       >
         {failure && desktop && (
           <div className="recovery-actions">
-            <button
-              type="button"
-              disabled={working}
-              onClick={() =>
-                void run(async () => {
-                  if (failure.needsServerConnection) {
-                    await desktop.openConnectionSettings();
-                    return;
-                  }
-                  if (settingsError || (firstSetup && !welcome)) {
-                    const [preferences, settings] = await Promise.all([
-                      desktop.getPreferences(),
-                      desktop.getSettings(),
-                    ]);
-                    applyPreferences(preferences);
-                    if (firstSetup) {
-                      localChoiceSaved.current = Boolean(settings.welcome);
-                      acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
-                    }
-                    setSettingsError('');
-                  }
-                  if (firstSetup && !localChoiceSaved.current) return;
-                  return desktop.prepare({ retry: true });
-                })
-              }
-            >
+            <button type="button" disabled={working} onClick={() => void retry()}>
               {working
                 ? 'Trying again…'
                 : failure.needsServerConnection
                   ? 'Reconnect to server'
                   : 'Try again'}
             </button>
+            {!failure.needsServerConnection && (
+              <button type="button" disabled={working} onClick={() => void retry(true)}>
+                Report bug
+              </button>
+            )}
             <button
               type="button"
               disabled={working}

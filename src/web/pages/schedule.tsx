@@ -18,6 +18,7 @@ import {
 } from '../components/plan-controls';
 import { Button, Loading, Notice } from '../components/ui';
 import { money } from '../lib/money';
+import { useOwnModel, WorkModel } from '../components/model-choices';
 
 export function ScheduleRow({
   schedule,
@@ -35,6 +36,7 @@ export function ScheduleRow({
   const pendingRun = useRef<{ requestId: string; expectedRevision: number } | null>(null);
   const working = useRef(false);
   const change = useDirectChange(schedule.id);
+  const ownModel = useOwnModel(schedule.model, 'schedule');
   const date = (value: string) => scheduleDate(value, schedule.timeZone, dateFormat);
   const canPause =
     schedule.enabled ||
@@ -127,6 +129,7 @@ export function ScheduleRow({
         )}
         {schedule.timeZone !== dateFormat.timeZone && <span>{schedule.timeZone}</span>}
         {schedule.monthlyUsd !== null && <span>≈{money(schedule.monthlyUsd)} a month</span>}
+        {ownModel && <span>{ownModel}</span>}
       </p>
       {runError && <Notice>{runError}</Notice>}
       <PlanDetails
@@ -181,6 +184,7 @@ export function ScheduleRow({
             {date(schedule.baselineObservation.checkedAt)}
           </p>
         )}
+        <WorkModel schedule={schedule} />
         {showRuns && <ScheduleRuns schedule={schedule} resultTurnId={resultTurnId} />}
       </PlanDetails>
     </article>

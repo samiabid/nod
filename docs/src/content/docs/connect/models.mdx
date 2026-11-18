@@ -17,7 +17,7 @@ Select **Add connection** (or **Add** when you already have a connection), then 
 
 | Connection                         | Setup                                                     | Initial choice                           |
 | ---------------------------------- | --------------------------------------------------------- | ---------------------------------------- |
-| Google Gemini                      | [AI Studio API key](https://aistudio.google.com/api-keys) | Gemini 3.8 Flash, medium effort          |
+| Google Gemini                      | [AI Studio API key](https://aistudio.google.com/api-keys) | Gemini 4 Argon, medium effort            |
 | OpenAI / ChatGPT                   | API key or existing ChatGPT sign-in                       | GPT-6.1 Sol / GPT-6 Sol, high effort     |
 | Anthropic                          | API key                                                   | Claude Opus 5.5, high effort             |
 | OpenRouter                         | API key or browser sign-in                                | GPT-6.1 Sol, high effort                 |
@@ -32,10 +32,10 @@ Other providers include Ant Ling, Baseten, Cerebras, DeepSeek, Fireworks AI, Gro
 
 When an account model list is available, Nod loads it. For services with only a bundled catalog, Nod saves the key and checks access on first use. Neither a catalog nor a saved key proves that your account has credit or permission to run every listed model.
 
-You can change the initial choice. Nod preserves a working choice when you add another connection. It uses the recommended model when available, otherwise the first supported model in that connection's catalog. For Google Gemini, you must choose a model if Gemini 3.8 Flash is unavailable. When Bedrock offers several models or profiles, you must also choose because profiles can change where requests are processed.
+You can change the initial choice. Nod preserves a working choice when you add another connection. It uses the recommended model when available, otherwise the first supported model in that connection's catalog. For Google Gemini, you must choose a model if Gemini 4 Argon is unavailable. When Bedrock offers several models or profiles, you must also choose because profiles can change where requests are processed.
 
-:::note[Google free access]
-Create a Gemini API key with your Google account in AI Studio. Gemini 3.8 Flash has a [free tier](https://ai.google.dev/gemini-api/docs/pricing), subject to project quotas and availability; Gemini 4 Argon needs paid API access. The free tier has different data-use terms, so review Google's terms before sending private material.
+:::note[Google API access]
+Create a Gemini API key with your Google account in AI Studio. Nod recommends Gemini 4 Argon, which requires paid API access. Gemini 3.8 Flash is a lower-cost option with a [free tier](https://ai.google.dev/gemini-api/docs/pricing), subject to project quotas and availability. The model picker shows these access limits. The free tier has different data-use terms, so review Google's terms before sending private material.
 :::
 
 Google does not permit third-party assistants to reuse [Gemini CLI OAuth](https://geminicli.com/docs/resources/faq/). A Gemini app subscription is not a Nod sign-in option. Anthropic's [authentication conditions](https://code.claude.com/docs/en/legal-and-compliance) also require an API connection for Claude in Nod.
@@ -46,7 +46,7 @@ Select **Settings** at the bottom of the sidebar, then **Models**. Select **Add 
 
 If a key has a recognizable format for a different provider, Nod shows the mismatch beside the key field before sending or saving it. Choose the matching provider or paste that provider's key. Unfamiliar formats still use the provider's normal connection checks; a matching format alone does not prove a key works.
 
-Select **Change** beside **Your model** to open **Choose a model**. Search by model, provider or account, or filter by provider. Models are grouped by connection, with recommended choices first in each group. A check marks both your current model and its connection. Image, audio and thinking icons identify each model’s capabilities; hover over an icon for its label. You can use the arrow keys, Home and End to move through models, then Enter to choose one. During onboarding, **More providers** opens the full list to browse or search.
+In **Settings > Models**, select the model in **When you talk to Nod, it uses …** to open **Choose a model**. Search by model, provider or account, or filter by provider. Models are grouped by connection, with recommended choices first in each group. A check marks both your current model and its connection. Image, audio and thinking icons identify each model’s capabilities; hover over an icon for its label. You can use the arrow keys, Home and End to move through models, then Enter to choose one. During onboarding, **More providers** opens the full list to browse or search.
 
 Select **Manage** beside a provider to see its accounts, add another connection or remove one. If a connection stops working, **Reconnect** restores a sign-in. For a key or server, add the details again; remove the old connection if you no longer need it. When it's the connection you selected, chat links to that screen.
 
@@ -54,11 +54,11 @@ Select **Reload models** beside a connected account to load its current model li
 
 NVIDIA reloads its hosted model list. A listed model can still require account access or an available route. A failed reload keeps the saved list and selection. If a successful reload removes your selected model, choose another model yourself.
 
-If a model request stops your task, the failure message links to **Settings > Models**. Use that link to check the connection or choose another model. The message keeps the provider's reason, including key, credit, quota, model access, and service errors. A daily quota error asks you to check the limit or choose another model and shows the provider's retry delay when supplied. A zero quota error asks you to check access or choose another model.
+If a model request stops your task, the failure message links to **Settings > Models**. Use that link to check the connection or choose another model. The message keeps the provider's reason, including key, credit, quota, model access, and service errors. Nod shows the provider's reason directly instead of asking the model that failed to rewrite it. When another connection is set up, the message says you can switch to it. A daily quota error asks you to check the limit or choose another model and shows the provider's retry delay when supplied. A zero quota error asks you to check access or choose another model.
 
-After Google reports a daily or zero quota, Nod pauses automatic requests for that model on that connection. This includes background checks, background helpers, and cache warming. The pause survives a restart. Other connections stay available. You can still ask again, replace the key, or select another model. Helpers required by your new request can also run. A successful request you start clears the pause. A provider retry delay permits another automatic attempt after that delay; it does not promise a quota reset. Without a delay, automatic work stays paused until recovery. Reloading the model list does not prove that quota is available.
+Nod checks your selected model with a tiny request when you choose it, including choosing it again, and when you start Nod. While a model's last request failed, **Settings > Models** shows the provider's reason beside its connection and chat shows it above the message box, before you send anything.
 
-If Google explicitly reports depleted prepayment credits, Nod pauses automatic requests for every model on that connection. You can still start a request yourself. A successful request you start clears this credit pause. An ordinary rate limit does not establish a credit problem.
+After a model fails a request, automatic work stops using that model on that connection. This includes background checks, background helpers and cache warming, and recurring schedules skip their runs. A one-time schedule still runs and reports the failure. Errors Nod retries on its own, such as an overload, and a conversation too long for the model's context don't count. Nod tries automatic work again after 2 minutes, and each further failure waits longer: 6, 18, 54 and 162 minutes, then 6 hours at most. A request that succeeds clears that model's failure. When a failing model works again, the connection's other paused models try again too. Requests you start always go through, and so does work that continues after you approve, sign in, pay, hand back the browser or connect an app. The failure survives a restart, and other connections stay available.
 
 To change to an available model, you can also tell Nod which model and service to use. This works in Nod, Telegram, and WhatsApp. Nod changes the saved selection for the next turn. Connecting a new service or signing in again still needs the private flow in the app.
 
@@ -90,7 +90,7 @@ Each connection keeps its own region. Nod does not switch regions after a failed
 
 Nod uses OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source) for open-source and locally hosted apps. Requests go to the OpenAI API and use your plan's included usage. ChatGPT lists Nod under [Settings → Usage](https://chatgpt.com/settings/usage), where you can see and limit its usage or disconnect it. It needs ChatGPT Plus or Pro. On other plans, OpenAI's consent page says a required permission isn't available, and the sign-in fails. In a workspace your organization manages, an admin has to allow third-party apps first, or OpenAI says your organization hasn't enabled access for this app. Otherwise, connect an OpenAI API key instead.
 
-ChatGPT sign-in listens on port `1455` where Nod's server runs. If another program uses that port, Nod stops with an error before it opens OpenAI. When connecting to a remote server, the final browser address may not load on your device. Copy that full address into **Callback URL** in Nod and select **Complete sign-in**. The server checks the sign-in and stores the connection; you do not need to expose port `1455` publicly.
+ChatGPT sign-in listens on port `1455` where Nod's server runs, or on another free port when `1455` is in use or reserved. When connecting to a remote server, the final browser address may not load on your device. Copy that full address into **Callback URL** in Nod and select **Complete sign-in**. The server checks the sign-in and stores the connection; you do not need to expose that port publicly.
 
 </TabItem>
 <TabItem label="Anthropic">
@@ -128,7 +128,7 @@ The `openrouter/free` and `openrouter/auto` routers can select different models 
 
 1. Select **Google Gemini**, then open the link to create a key in AI Studio.
 2. Copy the key into **API key** and select **Connect**.
-3. Keep Gemini 3.8 Flash for a capable starting choice, or choose another listed model.
+3. Keep the recommended Gemini 4 Argon if your project has paid API access. For a lower-cost option with limited free access, choose Gemini 3.8 Flash.
 
 </Steps>
 
@@ -225,16 +225,28 @@ If your selected connection is removed or needs reconnecting, the next connectio
 
 | To                        | Do this                                                                                                      |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Switch model              | Open **Settings → Models**, then pick a model.                                                               |
+| Switch model              | Open **Settings → Models**, then pick a model for chat, schedules or work Nod starts on its own.             |
 | Load a missing model list | Select **Manage** beside the provider, then **Load models** or **Try again**.                                |
 | Fix a broken connection   | Open **Manage** and **Reconnect** a sign-in, or add the key or server details again.                         |
 | Remove a connection       | Open **Manage** and select **Remove connection** beside the account. If it was selected, choose a new model. |
 
-## One model for everything
+## Models for each kind of work
 
-Nod uses the same model choice in the app, Telegram and WhatsApp. A task that's already running keeps the model it started with. An audio model's **Text support** label names its companion from the same connection. Requests without recordings use that companion; follow-ups that still include recordings use the audio model. Your saved model choice stays unchanged.
+Nod uses your model when you talk to it, in the app, Telegram and WhatsApp, and for tasks you start unless you give one its own model. Schedules, and work Nod starts on its own, such as checking your apps and the tasks it starts from them, can each use another model. In **Settings > Models**, select the model after **Schedules use** or **Work Nod starts on its own uses**:
 
-If a model request fails, Nod doesn't switch to another connection. It retries a temporary provider error, such as an overload or rate limit, up to three times.
+- **The same model** uses your model.
+- **The light model** uses the smaller model on your model's connection, such as Claude Haiku 5.5 or GPT-6 Luna, when it costs no more than your model. Without one, Nod uses your model.
+- Any connected text model.
+
+A lighter model costs much less, but in Nod's evals it read less and flagged fewer time-sensitive things for you than your main model.
+
+A schedule or task can have its own model too: in **Scheduled**, open it and select **Change** beside **Model**. **Settings > Models** lists the ones that differ from their default. When that work has priced usage in the last 30 days, each list shows what it cost, repriced on each model; otherwise it shows each model's token prices. Different models use different numbers of tokens for the same work, so the price is an estimate.
+
+You can also tell Nod, for example "Run my schedules on the light model" or "Use Opus for the weekly report", in Nod, Telegram or WhatsApp. Nod replies with the cost change.
+
+A change applies from the next turn; work that's already running keeps its model until then. Checking what Nod may do, writing the questions it asks you and reading your answers always use your model. If a model you chose for some work is no longer available, that work fails with the reason instead of switching models, and **Settings > Models** shows it as unavailable so you can choose another. Removing a connection returns the work that used it to its default: the model for its kind of work, else your model. An audio model's **Text support** label names its companion from the same connection. Requests without recordings use that companion; follow-ups that still include recordings use the audio model. Both use the smaller context and output limits of the pair. Your saved model choice stays unchanged.
+
+If a model request fails, Nod doesn't switch to another connection on its own; the notice above the chat box offers one when you have it. Nod retries a temporary provider error up to three times, waiting 4, 8 and 16 seconds. Temporary errors include an overload, a rate limit, and, for hosted providers, a request that gets no response within 90 seconds of being sent, cache warming included. Requests to a model server you run have no such limit, because local models can take minutes to start answering.
 
 Background work, such as memory upkeep, uses a smaller model from the same connection when it has one, such as `gpt-6-luna` or `claude-haiku-5-5`. Otherwise it uses your model or, for an audio model, its text companion. Background work and checks use the lightest reasoning their model offers: off, minimal, low or medium in that order, or the model's first effort level if it offers none of these.
 
@@ -242,11 +254,13 @@ Background work, such as memory upkeep, uses a smaller model from the same conne
 
 For a context window below 65,536 tokens, Nod uses short instructions and loads one detailed tool at a time. It reads guides, saved memory and older messages when needed. Large tool results stay in workspace files, with a short preview in the conversation.
 
-Nod reserves space for the reply and starts history compaction earlier. It keeps your current request and rules complete. If a request still does not fit, Nod asks for a shorter request or a model with a larger context window. Large images and tool schemas can need a larger window. Token estimates cannot guarantee that every provider accepts a request.
+Nod limits reply size and asks Pi to start history compaction earlier. Pi handles context limits from the provider and can summarize older work before continuing. Large images, tool schemas or a request that cannot be summarized can still need a larger window. A failure keeps the provider's or compaction's specific reason.
 
-Switching to a model with a smaller window can reduce the older context before the next reply. The full chat stays saved, and Nod can search it when it needs earlier details. If an unfinished request alone exceeds the new window, choose a model with more context or reset the conversation.
+Pi also manages saved context when you switch models. The full chat stays saved, and Nod can search earlier details. If the request or its summary cannot fit the new model, choose a model with more context or shorten the request.
 
 The same server checks still decide app actions, sign-ins and payments. A smaller context window does not change those checks. Model ability still affects whether Nod can complete a task.
+
+To compare what each model declares with how it scores on computer use, tool selection and coding, see [Measure model capabilities](/contribute/evals/#measure-model-capabilities).
 
 ## Decision checks
 

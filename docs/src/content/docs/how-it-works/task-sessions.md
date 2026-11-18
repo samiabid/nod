@@ -64,7 +64,7 @@ A model-written task list in the workspace does not replace the ledger. The exis
 5. A reply to the task's first message, question, file or result continues that task. An ordinary message goes to the coordinator, which can forward the exact owner message to one or more selected open tasks. A finished or stopped task reopens only when the owner replies to one of its messages. If the target is unclear, it asks.
 6. The task checks its completion condition, shares any result files and calls `task finish`. Its final reply goes directly to its message in the shared conversation.
 
-Each owner update has a revision. The server records delivery at a model boundary. A task cannot finish while an owner update remains queued. A correction closes the old waiting turn, so an old pending approval cannot execute after that correction.
+Each owner update has a revision. The server records delivery at a model boundary. A task cannot finish while an owner update remains queued. A correction closes the old waiting turn, so an old pending approval cannot execute after that correction. Saved setting changes bind that owner-input revision as well as the setting's version. Chat and task work use the same owner-evidence record, so a chat-started task keeps up to five owner chat messages from the 24 hours before it started. These messages only supply context. Later chat adds no permission. A schedule created or changed by that task retains the exact checked owner inputs and any proposal they answer. Later unrelated chat cannot add permission.
 
 The background observer starts a separate task for an outside action, question, or approval. A stable key for the source record and change returns the existing task. The task keeps event authority and the normal Trust check. Its wait leaves the observer free. A task started during quiet hours begins when they end; its first turn stays queued until then.
 
@@ -94,7 +94,7 @@ Shared storage does not put every change into every active model context. The se
 
 Coordination goes through the main session and ledger. Task sessions cannot forward owner updates to other tasks. They can read shared outputs. `delegate` is different: it runs temporary helpers inside a turn, returns their results to the parent and does not create saved task records.
 
-Shared information does not grant permission. For a task started from chat, the trust check uses its original owner request and owner messages addressed to it. Other task reports, files, briefs and memory cannot authorize an outside action. See [Approvals](/trust/approvals/).
+Shared information does not grant permission. For a task started from chat, the trust check uses its original owner request and owner messages addressed to it. It also keeps up to five owner chat messages from the 24 hours before the task started, as background only. Other task reports, files, briefs and memory cannot authorize an outside action. See [Approvals](/trust/approvals/).
 
 ## One task across web and chat apps
 

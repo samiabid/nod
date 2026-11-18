@@ -74,6 +74,7 @@ export async function safeRemoteFetch(
   redirects = 5,
 ): Promise<Response> {
   const prepared = new Request(input, init);
+  if (!prepared.headers.has('user-agent')) prepared.headers.set('user-agent', 'nod/0.1.0');
   const signal = AbortSignal.any([prepared.signal, AbortSignal.timeout(600_000)]);
   signal.throwIfAborted();
   const { url, address } = await new Promise<Awaited<ReturnType<typeof publicUrl>>>(
@@ -272,7 +273,16 @@ async function withRemoteMcp<T>(
 const loopback = (host: string) =>
   host === 'localhost' || host === '::1' || (isIP(host) === 4 && host.startsWith('127.'));
 
-export function ownerAddress(origin: string) {
+export async function publicHttps(value: string) {
+  const checked = await publicUrl(value);
+  if (checked.url.protocol !== 'https:') throw new Error('Use HTTPS for a public address.');
+  return checked;
+}
+
+export function ownerAddress(
+  origin: string,
+  elsewhere?: (value: string) => Promise<{ url: URL; address: string }>,
+) {
   const bound = new URL(origin);
   const boundHost = bound.hostname.replace(/^\[|\]$/g, '');
   return async (value: string) => {
@@ -286,8 +296,10 @@ export function ownerAddress(origin: string) {
         url.protocol === bound.protocol &&
         url.port === bound.port
       )
-    )
+    ) {
+      if (elsewhere) return elsewhere(value);
       throw new Error('The connection must stay on its saved address.');
+    }
     if (url.username || url.password) throw new Error('Remove the sign-in from the address.');
     const addresses = isIP(host)
       ? [{ address: host, family: isIP(host) }]
@@ -299,9 +311,12 @@ export function ownerAddress(origin: string) {
   };
 }
 
-export function ownerFetch(origin: string): typeof safeRemoteFetch {
+export function ownerFetch(
+  origin: string,
+  elsewhere?: Parameters<typeof ownerAddress>[1],
+): typeof safeRemoteFetch {
   const dependencies = {
-    validate: ownerAddress(origin),
+    validate: ownerAddress(origin, elsewhere),
     request: httpsRequest,
     plain: httpRequest,
   };
@@ -322,12 +337,12 @@ export function createDiscoveredTransport(
   return {
     validateEndpoint,
     async http(endpoint, headers, method, body, signal) {
+      signal?.throwIfAborted();
       const response = await request(endpoint, {
         method,
         signal,
         headers: {
           ...headers,
-          'User-Agent': 'nod/0.1.0',
           Accept: 'application/json, */*;q=0.1',
           ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}),
         },

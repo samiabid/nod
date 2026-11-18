@@ -13,13 +13,13 @@ import {
 export const areas = memoryAreas;
 export const maxBytes = 256 * 1024;
 
-const digitRun = /\d+(?:[ -]\d+)*/g;
+const digitRun = /\d+(?:[\s-]+\d+)*/g;
 const keyOrLoginLink = new RegExp(
   String.raw`https?:\/\/[^\s/@]+:[^\s/@]+@|` + secretToken.source,
   'i',
 );
 function holdsCard(run: string) {
-  const groups = run.split(/[ -]/);
+  const groups = run.split(/[\s-]+/);
   for (let start = 0; start < groups.length; start++) {
     let digits = '';
     for (let end = start; end < groups.length; end++) {
@@ -52,18 +52,20 @@ export const line = (max = noteChars) =>
     .min(1)
     .max(max)
     .refine((value) => !/\p{Cc}/u.test(value));
+export const lines = (max = noteChars) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(max)
+    .refine((value) => !/[^\P{Cc}\t\n]/u.test(value));
 const timestamp = z.iso.datetime({ offset: true });
 export const skillName = z
   .string()
   .regex(new RegExp(`^${slugPattern}$`))
   .max(64);
 export const skillDescription = line(skillDescriptionChars);
-export const skillBody = z
-  .string()
-  .trim()
-  .min(1)
-  .max(skillChars)
-  .refine((value) => !/[^\P{Cc}\t\n]/u.test(value));
+export const skillBody = lines(skillChars);
 const skillSchema = z.object({
   name: skillName,
   description: skillDescription,
@@ -89,7 +91,7 @@ export const factSchema = z
 const entryFields = z.object({
   area,
   slug,
-  text: line(),
+  text: lines(),
   abstract: line(120).optional(),
   origin: z.enum(['stated', 'inferred', 'email']),
   updated: timestamp,

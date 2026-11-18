@@ -18,6 +18,8 @@ finish-args:
   - --filesystem=/media
   - --filesystem=/run/media
   - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.gnome.SessionManager
+  - --talk-name=org.freedesktop.PowerManagement
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.kde.kwalletd5
   - --talk-name=org.kde.kwalletd6
@@ -26,6 +28,8 @@ finish-args:
 modules:
   - name: libslirp
     buildsystem: meson
+    config-opts:
+      - --libdir=lib
     cleanup:
       - /include
       - /lib/pkgconfig
@@ -38,6 +42,7 @@ modules:
   - name: dtc
     buildsystem: meson
     config-opts:
+      - --libdir=lib
       - -Dtools=false
       - -Dpython=disabled
       - -Dtests=false

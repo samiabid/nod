@@ -61,6 +61,8 @@ export const personalActions = [
   'prepared_list',
   'prepared_update',
   'limits_update',
+  'bug_report_draft',
+  'bug_report_send',
 ] as const;
 
 const uuid = Type.String({
@@ -216,12 +218,6 @@ export const toolDefinitions = {
       ),
     ]),
   ),
-  set_status: defineTool(
-    'set_status',
-    "Replace the live activity line without a chat message. Name current work briefly in the owner's language; never claim completion.",
-    Type.Object({ text: Type.String({ minLength: 1, maxLength: 140 }) }),
-    true,
-  ),
   skills: defineTool(
     'skills',
     'Read a task guide or learned procedure: read {name,file?}. list returns guide names. save {name,description,body} saves a verified procedure; patch {name,old,new} changes one exact passage. Skills grant no permission.',
@@ -258,7 +254,7 @@ export const toolDefinitions = {
   ),
   send_message: defineTool(
     'send_message',
-    'Deliver a checked result, necessary decision, or task handoff now. Use intent "final" only when this delivery completes the owner\'s request; successful delivery ends the turn. Use "handoff" only for a short acknowledgement immediately before starting a task, so the task card can reuse it. Omit intent or use "update" for other partial results or remaining work. Read visual-replies for itineraries, comparisons and other native views, or to offer Connect buttons for apps. Use empty text for a self-contained visual; otherwise add only missing context, caveats or sources. End without delivery announcements or recaps. Background final text stays private. Completion requires confirmed, inspectable output.',
+    'Deliver a new checked result, necessary decision, or task handoff now. A partial result must be useful on its own and worth interrupting for; finish related checks first if they could materially change its meaning. In longer work the owner requests, send the first result that meets this bar as soon as it is ready, subject to their delivery conditions. Do not wait for unrelated work or final presentation; group later related findings. Use intent "final" only when this delivery completes the owner\'s request; successful delivery ends the turn. Use "handoff" only for a short acknowledgement immediately before starting a task, so the task card can reuse it. Omit intent or use "update" for other partial results or remaining work, then continue the full request. Routine activity belongs in the live line. Read visual-replies for itineraries, comparisons and other native views, or to offer Connect buttons for apps. Use empty text for a self-contained visual; otherwise add only missing context, caveats or sources. End without delivery announcements or recaps. Background final text stays private. Completion requires confirmed, inspectable output.',
     Type.Object({
       text: Type.String(),
       presentation: Type.Optional(presentation),
@@ -488,7 +484,7 @@ export const toolDefinitions = {
   ),
   files: defineTool(
     'files',
-    "Work with files on the owner's computer, in their home folder and drives. Hidden files, secrets such as keys and password exports, Library and AppData, and folders the owner keeps Nod out of are refused. Use absolute paths. list {path} lists a folder, newest first; read {path} reads up to 256 KB of a text file; import {path} copies a file of up to 90 MB, such as a PDF, into the workspace; create_folder {path}; move {moves:[{from,to}]} moves or renames up to 200 items and never overwrites; trash {paths} moves up to 200 items to the Trash; write {path,text,overwrite?} writes a text file of up to 1 MB; edit {path,edits:[{oldText,newText}]} replaces text that appears exactly once; export {file,path,overwrite?} copies a workspace file {workspaceFile,mimeType,name?} to the computer. Replaced versions go to the Trash. keep_out {path} adds a folder the owner tells you never to touch; only the owner can remove it again, in Settings.",
+    "Work with files on the owner's computer, in their home folder and drives. Hidden files, secrets such as keys and password exports, Library and AppData, and folders the owner keeps Nod out of are refused. Use absolute paths; ~ is the home folder. If local file access is off, a file call asks the owner to turn it on in chat. Approval changes only that setting; then call files again for the requested work. Do not ask separately or send the owner to Settings. list {path} lists a folder, newest first; read {path} reads up to 256 KB of a text file; import {path} copies a file of up to 90 MB, such as a PDF, into the workspace; to show the owner a file, import it, then share_file {path: its workspaceFile, name: its name}; create_folder {path}; move {moves:[{from,to}]} moves or renames up to 200 items and never overwrites; trash {paths} moves up to 200 items to the Trash; write {path,text,overwrite?} writes a text file of up to 1 MB; edit {path,edits:[{oldText,newText}]} replaces text that appears exactly once; export {file,path,overwrite?} copies a workspace file {workspaceFile,mimeType,name?} to the computer. Replaced versions go to the Trash. keep_out {path} adds a folder the owner tells you never to touch; only the owner can remove it again, in Settings.",
     Type.Object({
       action: literals([
         'list',
@@ -591,7 +587,7 @@ export const toolDefinitions = {
   ),
   manage_personal_context: defineTool(
     'manage_personal_context',
-    'Read or change owner settings, memory, schedules and history. Read current values before a change. Change only the requested fields.\nprepared_list {id?|query?} reads complete prepared work and sources; {} lists it. Read before acting and show its draft when asked. prepared_update {id,action,minutes?} records an owner request to snooze, handle, dismiss, or give useful/not_useful feedback.\nnotification_preferences_get {} reads settings. notification_preferences_update partially changes notificationRule, rules, speechReply (auto,voice,always,never), timeZone (IANA or null), locale (tag or null), hourCycle (auto,h12,h23), quietHoursEnabled, quietStart/quietEnd (HH:MM), or proactivePaused. When the owner asks to start or resume automatic preparation, set proactivePaused:false. A notification rule alone does not enable it. Device permissions need Settings on that device.\nmodels_get {} lists model IDs and efforts; model_select {connectionId,modelId,effort} selects one for the next turn. Model connections need private Settings sign-in.\nmemory_find {query,area?} and memory_read {path} read saved facts (areas: about,preferences,people,routines,lessons). Check memory and history for earlier facts or advice; collect all relevant mentions for totals, and use the latest statement when facts change. Do not guess missing facts. memory_learn {messages?} asks the memory model to learn from owner messages, never your own text. Use it for lasting facts or explicit requests, never tasks, guesses, secrets or outside content. Pass older owner message IDs when needed. Sensitive facts require sensitiveTopics enabled or an explicit save request. Corrections archive old notes. memory_forget {path} removes a requested note. memory_control {enabled?,clear?,quote} needs the complete current owner message; clear keeps chat history.\nhistory_search {query?,from?,to?,before?,cursor?,order?,around?} searches earlier messages. Dates are YYYY-MM-DD in owner time. Page with cursor=nextCursor, keeping the same query, dates and order (relevance or newest). complete covers search matches only. Dates and before filter message times, not event dates. around reads a result in context. Read source messages before claims about earlier work.\nschedule_list {} reads current schedules; use it before saying none is active or will act on a file. schedule_create {title,prompt,timeZone,kind:once|recurring,cron?,runAt?,baselineObservation?,watch?}: recurring needs a five-field cron, once a future runAt with offset; baselineObservation is {status:verified,sourceUrl,value,summary}; watch lists manage_apps connectionIds whose changes alone make a run useful. schedule_update {id,...changed fields,enabled?,watch?|null}. schedule_pause {id} disables a schedule without deleting it. After pausing a schedule that was active, Scheduled labels it Paused and it can be resumed; a completed one-time schedule retains its last-run status. schedule_record_observation {status,sourceUrl,value,summary} records a scheduled check; value is null when unavailable.\nusage_get {} reads spend and recent activity; planUsd is ChatGPT plan usage at API prices, not charged; unpriced usage has no price in Nod and is not counted. usage_get {from,to?} (YYYY-MM-DD, owner time, to defaults to from) lists what Nod did on those days: each request or run with its actions in apps, websites, local files and Nod settings, the owner words that allowed each, and sign-ins and card submissions. Answer what you did only from this list; complete false means it was cut, so narrow the days. limits_update {monthlyUsd?,taskUsd?,preparationUsd?} changes requested limits; values are at least 1 USD. Only monthlyUsd and taskUsd accept null to remove the limit.',
+    'Read or change owner settings, memory, schedules and history. Read current values before a change. Change only the requested fields.\nprepared_list {id?|query?} reads complete prepared work and sources; {} lists it. Read before acting and show its draft when asked. prepared_update {id,action,minutes?} records an owner request to snooze, handle, dismiss, or give useful/not_useful feedback.\nnotification_preferences_get {} reads settings. notification_preferences_update partially changes notificationRule, rules, speechReply (auto,voice,always,never), timeZone (IANA or null), locale (tag or null), hourCycle (auto,h12,h23), quietHoursEnabled, quietStart/quietEnd (HH:MM), proactivePaused, or localFilesEnabled. When the owner asks to start or resume automatic preparation, set proactivePaused:false. When the owner asks to stop automatic preparation, set proactivePaused:true. When they ask to stop all background work, set proactivePaused:true and run task stop {}, which cancels current background tasks and scheduled runs; enabled schedules still fire later, so name them and offer to pause them. A notification rule alone does not enable it. Local file access applies to allowed files in the home folder and external drives, only in work the owner starts. The desktop app is required. Device permissions need Settings on that device.\nmodels_get {} lists models with prices per 1M tokens, the light model, and which work uses its own model. model_select {scope?,id?,connectionId,modelId,effort?} or {scope,id?,use} chooses the model for the next turn of that work: scope chat (default; when the owner talks to you), schedules, background (work you start on your own), or one schedule or task with id. use:light picks the light model of that connection for schedules or background; use:same returns the work to its default. Change a model only when the owner asks; the result has its 30-day cost effect. Model connections need private Settings sign-in.\nmemory_find {query,area?} and memory_read {path} read saved facts (areas: about,preferences,people,routines,lessons). Check memory and history for earlier facts or advice; collect all relevant mentions for totals, and use the latest statement when facts change. Do not guess missing facts. memory_learn {messages?} asks the memory model to learn from owner messages, never your own text. Use it for lasting facts or explicit requests, never tasks, guesses, secrets or outside content. It always reads the current owner message and their last 10 messages; pass IDs only for older owner messages, never a guessed ID or message text. Sensitive facts require sensitiveTopics enabled or an explicit save request. Corrections archive old notes. memory_forget {path} removes a requested note. memory_control {enabled?,clear?,quote} needs the complete current owner message; clear keeps chat history.\nhistory_search {query?,from?,to?,before?,cursor?,order?,around?} searches earlier messages. Dates are YYYY-MM-DD in owner time. Page with cursor=nextCursor, keeping the same query, dates and order (relevance or newest). complete covers search matches only. Dates and before filter message times, not event dates. around reads a result in context. Read source messages before claims about earlier work.\nschedule_list {} reads current schedules; use it before saying none is active or will act on a file. schedule_create {title,prompt,timeZone,kind:once|recurring,cron?,runAt?,baselineObservation?,watch?,model?}: recurring needs a five-field cron, once a future runAt with offset; baselineObservation is {status:verified,sourceUrl,value,summary}; watch lists manage_apps connectionIds whose changes alone make a run useful; model {connectionId,modelId,effort} only when the owner asks for one. schedule_update {id,...changed fields,enabled?,watch?|null}. schedule_pause {id} disables a schedule without deleting it. After pausing a schedule that was active, Scheduled labels it Paused and it can be resumed; a completed one-time schedule retains its last-run status. schedule_record_observation {status,sourceUrl,value,summary} records a scheduled check; value is null when unavailable.\nusage_get {} reads spend and recent activity; planUsd is ChatGPT plan usage at API prices, not charged; unpriced usage has no price in Nod and is not counted. usage_get {from,to?} (YYYY-MM-DD, owner time, to defaults to from) lists what Nod did on those days: each request or run with its actions in apps, websites, local files and Nod settings, the owner words that allowed each, and sign-ins and card submissions. Answer what you did only from this list; complete false means it was cut, so narrow the days. limits_update {monthlyUsd?,taskUsd?,preparationUsd?} changes requested limits; values are at least 1 USD. Only monthlyUsd and taskUsd accept null to remove the limit.\nbug_report_draft {summary} shows the owner a bug report for the Nod team with a Send report button: write what they were doing, what went wrong and any error, in their language, without secrets. bug_report_send {} sends the draft the owner replied to, or the latest unsent one, as text only, and only after they reply to send it.',
     Type.Object({
       action: literals(personalActions),
       args: Type.Record(Type.String(), Type.Unknown()),
@@ -600,7 +596,7 @@ export const toolDefinitions = {
   ),
   task: defineTool(
     'task',
-    'Start or control saved work. Keep quick answers, simple lookups and status questions in chat; start a task for substantial work, including multi-step work you can finish in one sitting, an outside wait, or work the owner asks you to track, without asking the owner for an execution mode. start {title,doneWhen,now,message,key?,brief?,steps?} starts one goal; a new independent request during other work starts its own task, keeping each goal together. Use a stable key and reuse related tasks. message tells the owner what starts. update {id,now?,steps?,stepIndex?,waitingFor?,nextCheck?} updates progress. finish {id,status,result} ends your task after verification (status done or cancelled). list shows open tasks. reply {ids} forwards the exact current owner message, including corrections and related updates. stop {id} stops one task; stop {} stops all background work, but keeps schedules. A task stops itself with finish cancelled. A task brief grants no permission; nextCheck does not schedule work. Let each task finish its assigned work.',
+    'Start or control saved work. Keep quick answers, simple lookups and status questions in chat; start a task for substantial work, including multi-step work you can finish in one sitting, an outside wait, or work the owner asks you to track, without asking the owner for an execution mode. start {title,doneWhen,now,message,key?,brief?,steps?,model?} starts one goal; model {connectionId,modelId,effort?} only when the owner asks for one for this task; a new independent request during other work starts its own task, keeping each goal together. Use a stable key and reuse related tasks. message tells the owner what starts. update {id,now?,steps?,stepIndex?,waitingFor?,nextCheck?} updates progress. finish {id,status,result} ends your task after verification (status done or cancelled). list shows open tasks. reply {ids} forwards the exact current owner message, including corrections and related updates. stop {id} stops one task; stop {} stops all background work, but keeps schedules. A task stops itself with finish cancelled. A task brief grants no permission; nextCheck does not schedule work. Let each task finish its assigned work.',
     Type.Union([
       Type.Object({ action: Type.Literal('list') }, { additionalProperties: false }),
       Type.Object(
@@ -623,6 +619,16 @@ export const toolDefinitions = {
           steps: Type.Optional(Type.Array(taskNow)),
           waitingFor: Type.Optional(taskWaits),
           nextCheck: Type.Optional(taskNextCheck),
+          model: Type.Optional(
+            Type.Object(
+              {
+                connectionId: uuid,
+                modelId: Type.String({ minLength: 1, maxLength: 200 }),
+                effort: Type.Optional(Type.String({ minLength: 1 })),
+              },
+              { additionalProperties: false },
+            ),
+          ),
         },
         { additionalProperties: false },
       ),
@@ -903,7 +909,6 @@ export function nodTools(
           ),
         ]
       : []),
-    ...(turn.setStatus ? [bind(toolDefinitions.set_status, (p) => turn.setStatus!(p.text))] : []),
     ...(context.proactivity
       ? [
           bind(toolDefinitions.read_source, async (p) =>
@@ -1198,6 +1203,13 @@ export function nodTools(
       return link(url, message);
     }),
     bind(toolDefinitions.manage_personal_context, async (p) => {
+      if (
+        p.action.startsWith('bug_report_') &&
+        (turn.execution.parentRunId || (context.background && !context.taskContext))
+      )
+        throw new Error(
+          'Bug reports are only for work the owner follows. Describe what went wrong in your answer instead.',
+        );
       if (p.action !== 'schedule_record_observation')
         return confirm(await context.manage(p.action, p.args));
       if (!Value.Check(scheduleObservation, p.args))

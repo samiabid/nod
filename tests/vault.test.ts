@@ -3596,7 +3596,7 @@ test('analytics routes collapse private paths to known pages', async () => {
   );
 });
 
-test('desktop onboarding turns on open at login once and resumes without repeating it', async () => {
+test('desktop onboarding saves native preferences once and follows model updates without stale reads', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 30_000,
     input: String.raw`
@@ -3629,6 +3629,9 @@ let completePreparation;
 let preparationCompleted=false;
 let completions=0;
 let statusListener;
+let modelConnected=true;
+let modelFailure;
+let modelReads=0;
 window.nodDesktop={
   ready:async()=>{rendererReady++},
   status:async()=>({phase:'ready',runtime:{phase:'preparing'}}),
@@ -3640,8 +3643,8 @@ window.nodDesktop={
 const calls=[];
 window.fetch=globalThis.fetch=async(url,options={})=>{
  const path=new URL(url,window.location.href).pathname;calls.push(path);
- if(path==='/api/account/prepare')return new Promise(resolve=>{completePreparation=()=>resolve(Response.json({ok:true}))});
- if(path==='/api/models')return Response.json({connections:[{id:'synthetic',provider:'anthropic',method:'api_key',label:'Synthetic model',managed:false,status:'connected',models:[{id:'synthetic-model',name:'Synthetic model',efforts:['medium'],images:false,contextWindow:1000}]}],selection:{connectionId:'synthetic',modelId:'synthetic-model',effort:'medium'}});
+ if(path==='/api/account/prepare')return new Promise((resolve,reject)=>{completePreparation=(response=Response.json({ok:true}))=>response instanceof Error?reject(response):resolve(response)});
+ if(path==='/api/models'){modelReads++;return Response.json({connections:modelConnected?[{id:'synthetic',provider:'anthropic',method:'api_key',label:'Synthetic model',managed:false,status:'connected',models:[{id:'synthetic-model',name:'Synthetic model',efforts:['medium'],images:false,contextWindow:1000}]}]:[],selection:modelConnected?{connectionId:'synthetic',modelId:'synthetic-model',effort:'medium'}:null,...(modelFailure?{selectionIssue:{reason:modelFailure}}:{})})}
  if(path==='/api/preferences')return Response.json({timeZone:'Europe/Lisbon',locale:'en-GB',hourCycle:'h23',quietHoursEnabled:false,quietStart:'22:00',quietEnd:'08:00',speechReply:'auto',speechVoice:null});
  if(path==='/api/speech')return Response.json({transcription:false,synthesis:false,voices:[],speechVoice:null,speechReply:'auto'});
  if(path==='/api/memory')return Response.json({saving:true,sensitive:false,notes:[],skills:[],archive:[]});
@@ -3656,11 +3659,25 @@ const {createRoot}=await import('react-dom/client');
 const {Onboarding}=await import('./src/web/pages/onboarding/index.tsx');
 globalThis.IS_REACT_ACT_ENVIRONMENT=true;
 const session={user:{id:'synthetic-native-owner',name:'',email:null,avatarUrl:null},settings:{usageData:false,onboardingCompleted:false}};
+const {sessionStore}=await import('./src/web/lib/session.ts');
+const {writeStep}=await import('./src/web/pages/onboarding/storage.ts');
+const {onboardingVersion}=await import('./src/shared/onboarding.ts');
+sessionStore.getSnapshot=()=>({session,epoch:0});
+let stream;
+globalThis.EventSource=class{
+ static CLOSED=2;
+ readyState=1;
+ closed=false;
+ constructor(){stream=this}
+ close(){this.closed=true;this.readyState=2}
+};
 let root=createRoot(document.getElementById('root'));
 const render=()=>act(async()=>root.render(createElement(Onboarding,{user:session.user,onComplete:async()=>{completions++;assert.equal(preparationCompleted,true,'No completion before server preparation finishes')}})));
 const settle=()=>act(async()=>{await new Promise(resolve=>setTimeout(resolve,20))});
 const waitFor=async condition=>{for(let at=0;at<100&&!(await condition());at++)await settle();assert.ok(await condition())};
 const button=text=>[...document.querySelectorAll('button')].find(value=>value.textContent.trim()===text);
+const changed=()=>act(async()=>stream.onmessage(new dom.window.MessageEvent('message',{data:JSON.stringify({type:'refresh'})})));
+const waitForModel=async condition=>{for(let at=0;at<200&&!condition();at++)await settle();assert.ok(condition())};
 await render();
 assert.equal(window.location.search,'');
 await waitFor(()=>button('Try again'));
@@ -3687,7 +3704,7 @@ await waitFor(()=>document.querySelector('main [role="status"]'));
 assert.equal(document.querySelector('[role="switch"]'),null);
 assert.equal(saves,2,'a completed native step is never written again');
 await act(async()=>root.unmount());
-await store.save({onboardingCompleted:true});
+assert.equal(Object.hasOwn(await store.get(),'onboardingCompleted'),false);
 const {AccountSettings}=await import('./src/web/components/account-settings.tsx');
 window.nodDesktop.onPreferences=()=>()=>{};
 const account={user:session.user,theme:'system',usageData:false,saving:false,onSettings(){},async onTheme(){},async onUsageData(){},async onTraces(){}};
@@ -3728,8 +3745,8 @@ root=createRoot(document.getElementById('root'));
 await render();
 await waitFor(()=>document.querySelector('main [role="status"]'));
 assert.equal(saves,beforeBlocked+1);
-await store.save({onboardingCompleted:true});
-assert.equal((await store.get()).onboardingCompleted,true);
+assert.equal(Object.hasOwn(await store.get(),'onboardingCompleted'),false);
+assert.equal((await store.get()).onboardingPreferenceStep,'complete');
 assert.equal((await store.get()).launchAtLogin,false);
 await act(async()=>root.unmount());
 assert.equal(calls.some(path=>path.startsWith('/api/desktop/setup')),false);
@@ -3748,7 +3765,19 @@ const emailSkip=()=>document.querySelector('[data-step="email"] .ob-footer-end b
 assert.equal(emailSkip().disabled,false);
 await act(async()=>emailSkip().click());
 await waitFor(()=>document.querySelector('[data-step="about"]'));
-for(let at=0;at<10&&!document.querySelector('[data-step="privacy"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
+modelFailure='Synthetic provider failed while About you was open.';
+const beforeAboutRefresh=modelReads;
+await changed();
+await waitForModel(()=>modelReads>beforeAboutRefresh);
+assert.ok(document.querySelector('[data-step="about"]'));
+for(let at=0;at<10&&!document.querySelector('[data-step="brain"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
+await waitFor(()=>document.querySelector('[data-step="brain"]'));
+await waitForModel(()=>document.querySelector('.ob-brain-connected details')?.textContent.includes(modelFailure));
+modelFailure=undefined;
+await changed();
+await waitForModel(()=>!document.querySelector('.ob-brain-connected details'));
+assert.ok(document.querySelector('[data-step="brain"]'));
+await act(async()=>button('Continue').click());
 await waitFor(()=>document.querySelector('[data-step="privacy"]'));
 assert.ok(calls.includes('/api/onboarding/profile'));
 await act(async()=>button('Continue').click());
@@ -3761,11 +3790,54 @@ await act(async()=>statusListener({phase:'ready',runtime:{phase:'ready'}}));
 await settle();
 assert.equal(completions,0,'Desktop readiness must not complete onboarding before server preparation');
 assert.ok(document.querySelector('.setup-progress [role="status"]'));
+const preparationFailure='Synthetic workspace could not mount its volume.';
+await act(async()=>completePreparation(Response.json({error:preparationFailure},{status:503})));
+await waitFor(()=>document.querySelector('.setup-progress [role="alert"]'));
+assert.ok(document.querySelector('.setup-progress [role="alert"]').textContent.includes(preparationFailure));
+assert.ok(document.querySelector('.setup-progress details').textContent.includes('503'));
+assert.equal(document.querySelector('.setup-progress details').open,false);
+assert.equal(completions,0);
+await act(async()=>statusListener({phase:'ready',runtime:{phase:'ready'}}));
+assert.ok(document.querySelector('.setup-progress [role="alert"]').textContent.includes(preparationFailure));
+const preparationCalls=calls.filter(path=>path==='/api/account/prepare').length;
+await act(async()=>button('Try again').click());
+await waitFor(()=>calls.filter(path=>path==='/api/account/prepare').length===preparationCalls+1);
+assert.equal(document.querySelector('.setup-progress [role="alert"]'),null);
+assert.equal(completions,0);
+const transportFailure='Synthetic fetch TypeError during workspace setup.';
+await act(async()=>completePreparation(new TypeError(transportFailure)));
+await waitFor(()=>document.querySelector('.setup-progress [role="alert"]'));
+assert.equal(document.querySelector('.setup-progress [role="alert"]').textContent.includes(transportFailure),false);
+assert.ok(document.querySelector('.setup-progress details').textContent.includes(transportFailure));
+assert.equal(completions,0);
+await act(async()=>button('Try again').click());
+await waitFor(()=>calls.filter(path=>path==='/api/account/prepare').length===preparationCalls+2);
+assert.equal(document.querySelector('.setup-progress [role="alert"]'),null);
 await act(async()=>{preparationCompleted=true;completePreparation()});
 await waitFor(()=>completions===1);
 await settle();
 assert.equal(completions,1);
 await act(async()=>root.unmount());
+modelConnected=false;
+writeStep({owner:session.user.id,step:'brain',version:onboardingVersion});
+root=createRoot(document.getElementById('root'));
+await render();
+await waitFor(()=>button('Continue')?.disabled===true);
+assert.ok(stream);
+modelConnected=true;
+await changed();
+await waitForModel(()=>button('Continue')?.disabled===false);
+modelFailure='Synthetic provider rejected the selected model request.';
+await changed();
+await waitForModel(()=>document.querySelector('.ob-brain-connected details')?.textContent.includes(modelFailure));
+assert.ok(document.querySelector('.ob-brain-connected [role="alert"]'));
+assert.equal(button('Continue').disabled,false);
+await act(async()=>root.unmount());
+assert.equal(stream.closed,true);
+const beforeClosed=modelReads;
+await changed();
+await settle();
+assert.equal(modelReads,beforeClosed);
 await rm(directory,{recursive:true,force:true});
 dom.window.close();
 process.exit(0);

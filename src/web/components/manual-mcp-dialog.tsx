@@ -92,9 +92,7 @@ export function ManualMcpDialog({
           <Field label="Server URL">
             <Input
               name="endpoint"
-              type="url"
               placeholder="https://example.com/mcp"
-              pattern="[Hh][Tt][Tt][Pp][Ss]://.*"
               required
               maxLength={2048}
               spellCheck={false}

@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
-import { copyFile, mkdir, mkdtemp, realpath } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, realpath, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { createAgentSession } from '@earendil-works/pi-coding-agent';
@@ -110,6 +110,8 @@ export interface Stack {
   ): Promise<Response>;
   origin: string;
   directory: string;
+  home?: string;
+  trashed?: string[];
   container: string;
   pool: pg.Pool;
   waiting(alias: string): string;
@@ -132,6 +134,7 @@ export function createStackRequest(baseUrl: string, cookie: string): Stack['requ
 
 export async function startStack(options: {
   model: Model;
+  backgroundModel?: string;
   integrations: IntegrationProvider;
   observations?: import('../../src/ports/proactivity.ts').ObservationProvider[];
   proactiveBaseline?: boolean;
@@ -139,6 +142,7 @@ export async function startStack(options: {
   siteUpstreamPort: number;
   hermetic: boolean;
   environment: Record<string, string | undefined>;
+  localFiles?: Record<string, string | Buffer>;
 }): Promise<Stack> {
   const { model, environment } = options;
   const typesafe = environment.TYPESAFE_API_KEY?.trim();
@@ -153,6 +157,17 @@ export async function startStack(options: {
   process.umask(0);
   await mkdir(workspaceRoot, { recursive: true });
   await mkdir(toolsRoot);
+  if (options.localFiles && process.platform === 'win32')
+    throw new Error('Local-file evals need macOS or Linux, where mounted drives can be kept out.');
+  const home = options.localFiles ? join(directory, 'home') : undefined;
+  const trashed: string[] = [];
+  if (home) {
+    await mkdir(join(directory, 'trash'));
+    for (const [path, content] of Object.entries(options.localFiles!)) {
+      await mkdir(dirname(join(home, path)), { recursive: true });
+      await writeFile(join(home, path), content);
+    }
+  }
   const baseDatabase = new URL(await integrationDatabaseUrl(repository, environment));
   if (!['127.0.0.1', 'localhost'].includes(baseDatabase.hostname))
     throw new Error('The evaluation requires a local PostgreSQL test database.');
@@ -371,6 +386,30 @@ export async function startStack(options: {
       },
     });
     await models.initialize();
+    if (options.backgroundModel) {
+      if (!('setRoute' in models))
+        throw new Error('--background-model needs app code that supports model routes.');
+      const connection = models.view().connections.find((row) => row.provider === model.provider);
+      const choice = connection?.models.find((item) => item.id === options.backgroundModel);
+      if (options.backgroundModel !== 'light' && !choice)
+        throw new Error(
+          `${options.backgroundModel} is not a ${model.provider} model. Use light or a model from the --model provider.`,
+        );
+      if (options.backgroundModel === 'light' && !models.view().light)
+        throw new Error(
+          `${model.provider} has no light model that costs no more than ${model.name}, so --background-model light would run ${model.name}.`,
+        );
+      await models.setRoute(
+        'background',
+        options.backgroundModel === 'light'
+          ? 'light'
+          : {
+              connectionId: connection!.id,
+              modelId: choice!.id,
+              effort: choice!.efforts.includes('high') ? 'high' : choice!.efforts[0]!,
+            },
+      );
+    }
     const computer = createContainerBrowserComputer({
       dataRoot: join(directory, '.local'),
       container: browserContainer,
@@ -387,12 +426,16 @@ export async function startStack(options: {
             provider: model.provider,
             model: model.name,
             apiKey: model.apiKey,
-            resolve: () => models.resolve(),
+            resolve: (choice) => models.resolve(false, choice),
             sessionRoot,
             ...(model.effort
               ? {
                   createSession: (input) =>
-                    createAgentSession({ ...input, thinkingLevel: model.effort }),
+                    createAgentSession(
+                      input?.model?.id === model.name
+                        ? { ...input, thinkingLevel: model.effort }
+                        : input,
+                    ),
                 }
               : {}),
           }),
@@ -478,6 +521,19 @@ export async function startStack(options: {
         }),
         linkPreviews: createPublicLinkPreviewProvider(),
         model: { provider: model.provider, name: model.name, configured: true },
+        ...(home
+          ? {
+              localFilesHome: home,
+              trash: {
+                ready: async () => true,
+                async put(path: string, signal?: AbortSignal) {
+                  signal?.throwIfAborted();
+                  await rename(path, join(directory, 'trash', `${randomUUID()}-${basename(path)}`));
+                  trashed.push(relative(home, path));
+                },
+              },
+            }
+          : {}),
       },
       { heartbeat: false },
     );
@@ -487,6 +543,8 @@ export async function startStack(options: {
     const cookie = `${accessCookie(port)}=${await accessKey(join(directory, '.local'))}`;
     const engine = application.proactivity;
     return {
+      home,
+      trashed,
       get finalUsage() {
         return finalUsage;
       },
