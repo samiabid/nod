@@ -16,7 +16,7 @@ Ask in chat. For example:
 - "Every weekday at 8:00, summarize my calendar and anything urgent in my inbox."
 - "Tomorrow at 15:00, remind me to call the landlord."
 
-A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
+A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy, and uses the model you named for it, if any. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
 
 Nod uses your time zone, saved from your browser the first time you use Nod. Change it in **Settings → General**. If Nod doesn't know your time zone, it asks.
 
@@ -60,7 +60,10 @@ flowchart TD
 - **What you asked to get arrives every time.** A summary, brief or reminder comes on every run. A watch or check-in messages you only when something needs you, such as a real price drop, a problem or a question. Routine checks stay quiet.
 - **A failed run tells you.** If a run stops on an error, Nod sends a short message that names the schedule and says what stopped it, so a missing summary never goes unnoticed.
 - **It replies where you asked.** A schedule you set up on Telegram sends its messages to Telegram.
-- **Approvals still apply.** Each action is checked against the instruction that created the schedule. If an action isn't covered, Nod asks you first, naming the schedule and what it's for. If the check itself can't decide, the action doesn't run and you aren't asked. See [Approvals](/trust/approvals/).
+- **Corrections keep the rest.** Nod keeps the owner request and later changes used to set up the schedule. “Every hour instead” changes timing. “Send it to Lena instead” changes the recipient. Other limits stay in effect, and a later “only summarize” removes an earlier send request. Timing changes keep their owner request even when the work instruction stays the same. There is no ten-change reset.
+- **Approvals still apply.** Each outside action passes the same [trust check](/trust/approvals/). The checker gets the saved owner inputs in order, the exact proposal a reply answered, and the run time. Earlier eligible owner messages can explain “it” or “that folder”; they cannot grant another action. Chat, tasks and schedules use the same source-selection rules. LLM and decision-model checks receive the same evidence. If your instructions do not cover an action, Nod asks first. If the check cannot decide, the action does not run and Nod does not ask.
+- **A complete instruction approval has a clear scope.** When you approve a new complete schedule instruction, Nod shows its future work, targets, timing and limits. That approval can cover the recurring work it describes. Approving a name or timing change changes only those fields. Approving one email never grants recurring sends.
+- **Saved instructions stay traceable.** Each run keeps its execution request, run time and owner inputs. Required messages that become withdrawn or unavailable cannot return as permission. Nod then refuses work that needs them. You can save a complete replacement in **Schedules**, or approve a complete replacement Nod proposes. A check that cannot process the complete request refuses it; it never drops older limits to fit. Existing schedules keep their known instruction without guessed earlier context. Some schedules changed through an older Nod version have incomplete permission history. To use them again, edit their complete instruction in **Schedules**, or approve a complete replacement that Nod proposes.
 - **One run at a time.** While a run is still queued, working or waiting for your answer, a recurring schedule skips its next runs. A one-time schedule waits for the active run to end. A run does its work itself and can't set up more schedules.
 - **Watches skip unchanged runs.** When a recurring check can only find something new after a change in your connected accounts, such as waiting for a reply, Nod saves which accounts it watches. Before each run, Nod checks those accounts for new mail, changed events or app activity without a model call, and skips the run when nothing changed since the last finished run. The first run, and the run after a failed one, always run. Reminders, digests, websites and checks tied to a time don't skip.
 
@@ -86,7 +89,9 @@ The first time Nod messages you about something on its own, such as a calendar c
 
 ## Edit schedule details
 
-Select **Edit schedule** to review its name, instructions and timing together. Timing changes preview the next run without changing the saved schedule. **Save changes** applies only the fields you changed, so renaming a schedule keeps its next run. **Cancel** closes the editor without saving.
+Select **Edit schedule** to review its name, instructions and timing together. Timing changes preview the next run without changing the saved schedule. **Save changes** applies only the fields you changed, so renaming a schedule keeps its next run. Editing the complete work instruction supplies a new complete instruction. A name or timing edit keeps the existing work and its permission limits. **Cancel** closes the editor without saving.
+
+A schedule uses the model for schedules from **Settings > Models**. To give one schedule its own model, open **See details** and select **Change** beside **Model**. When a recurring schedule shows a projected monthly cost, it prices the schedule's recent runs on that model. See [Models for each kind of work](/connect/models/#models-for-each-kind-of-work).
 
 **Undo** restores the previous values only if no newer change has replaced them. The Undo notice stays available while you hover over it, focus it, or switch away from Nod. If the schedule changes while you edit, your draft stays open so you can review it.
 

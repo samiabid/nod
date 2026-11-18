@@ -37,6 +37,7 @@ import { formatDateTime, useDateFormat } from '../lib/date-format';
 import { post, errorMessage } from '../lib/api';
 import { ScheduleRow } from './schedule';
 import { LiveLine } from '../components/live-line';
+import { WorkModel } from '../components/model-choices';
 
 const icons = {
   queued: Clock,
@@ -216,7 +217,7 @@ export function TaskCard({
       <h2 className="task-preview-heading">
         <button
           type="button"
-          className="task-preview-head"
+          className={`task-preview-head${showLive ? ' task-preview-head-live' : ''}`}
           aria-expanded={expanded}
           aria-controls={`${headingId}-body`}
           onClick={() => {
@@ -238,17 +239,20 @@ export function TaskCard({
             </span>
             {chevron}
           </span>
-          <span className="task-preview-line">
-            {showLive ? (
-              <LiveLine item={showLive} />
-            ) : (
+          {!showLive && (
+            <span className="task-preview-line">
               <Markdown allowedElements={[]} unwrapDisallowed>
                 {line}
               </Markdown>
-            )}
-          </span>
+            </span>
+          )}
         </button>
       </h2>
+      {showLive && (
+        <div className="task-preview-live-line">
+          <LiveLine item={showLive} />
+        </div>
+      )}
       <div
         className="task-preview-disclosure"
         id={`${headingId}-body`}
@@ -334,6 +338,7 @@ export function TaskCard({
                 )}
               </ul>
             )}
+            {!closed(task) && task.work && <WorkModel task={task} />}
             {(task.revision ?? 0) > (task.appliedRevision ?? 0) && !closed(task) && (
               <p className="task-preview-meta">Owner update queued</p>
             )}

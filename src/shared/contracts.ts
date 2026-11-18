@@ -2,6 +2,7 @@ import type { Presentation } from './presentation';
 import type { TaskSuggestions } from './onboarding';
 import type { TrustBecause } from './trust';
 import type { AnswerChoices } from './answer-choices';
+import type { ModelIssue, ModelSelection, WorkKind } from './models';
 export type TurnStatus = 'queued' | 'running' | 'succeeded' | 'waiting' | 'failed' | 'cancelled';
 export interface Artifact {
   id: string;
@@ -39,6 +40,7 @@ export interface Message {
   choiceAnswer?: { choiceIds: string[]; text?: string };
   approval?: MessageApproval;
   cardAnswer?: true;
+  work?: { kind: 'task' | 'schedule'; id: string; title: string };
 }
 export type ApprovalState = 'pending' | 'working' | 'done' | 'declined' | 'expired' | 'uncertain';
 export interface MessageApproval {
@@ -87,6 +89,8 @@ export interface Activity {
   model?: string;
   received?: true;
   background?: true;
+  runId?: string;
+  recent?: Array<{ id: string; summary: string; site: string | null }>;
 }
 export interface VaultLoginEntry {
   kind: 'login';
@@ -252,10 +256,13 @@ export interface Configuration {
   model: string;
   llmReady: boolean;
   modelReconnect: boolean;
+  modelIssue?: ModelIssue;
+  modelAlternative?: ModelSelection & { label: string };
   integrationsReady: boolean;
   conversationResetEnabled: boolean;
 }
 export interface AppState {
+  chatRecovery?: { turnId: string };
   tasks?: Task[];
   threadId: string;
   hasEarlierMessages?: boolean;
@@ -306,6 +313,9 @@ export interface Task {
   stepIndex?: number;
   revision?: number;
   appliedRevision?: number;
+  model?: ModelSelection | null;
+  work?: WorkKind;
+  scheduleModel?: ModelSelection;
 }
 export interface TaskDetail {
   task: Task;
@@ -344,6 +354,7 @@ export interface Schedule {
   activeRun: { turnId: string; status: 'queued' | 'running' | 'waiting' } | null;
   baselineObservation: ScheduleObservation | null;
   watch: string[] | null;
+  model: ModelSelection | null;
   monthlyUsd: number | null;
 }
 export type ScheduleObservation = {
@@ -385,6 +396,7 @@ export interface Preferences {
   quietStart: string;
   quietEnd: string;
   proactivePaused: boolean;
+  localFilesEnabled: boolean;
 }
 export type ChannelProvider = 'telegram' | 'whatsapp';
 export interface ChannelLinkStatus {

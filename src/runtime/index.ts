@@ -1,5 +1,6 @@
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
+import { appPages } from '../shared/app-links.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -20,7 +21,7 @@ import type {
   RuntimeResult,
   SkillLibrary,
 } from '../ports/agent.ts';
-import { appConfirmation, ModelRequestError } from '../ports/agent.ts';
+import { appConfirmation, ContextLimitError, ModelRequestError } from '../ports/agent.ts';
 import type { Computer, Workspace } from '../ports/computer.ts';
 import { BrowserActionError } from '../ports/computer.ts';
 import { threadIdentity } from '../ports/thread-identity.ts';
@@ -234,6 +235,7 @@ export function createAgentRuntime(dependencies: {
     const sites = new Map<string, string>();
     let stopped = false;
     let modelError: string | undefined;
+    let contextExhausted = false;
     let modelIncomplete: 'output' | 'context' | undefined;
     const progress = toolProgress();
     let completed = false;
@@ -887,7 +889,8 @@ export function createAgentRuntime(dependencies: {
         try {
           child = await agent.open({
             ...source,
-            automatic: !context.currentMessageId,
+            ...(context.model ? { model: context.model } : {}),
+            automatic: Boolean(context.automatic),
             ephemeral: true,
             systemPrompt: system,
             ownerContext: ownerContext(context),
@@ -948,19 +951,6 @@ export function createAgentRuntime(dependencies: {
           ...shared,
           execution,
           delegate,
-          ...(speaks
-            ? {
-                setStatus: async (text: string) => {
-                  const summary = (dependencies.redactError ?? String)(text.trim()).replace(
-                    /\s+/g,
-                    ' ',
-                  );
-                  if (!summary) throw new Error('Write a short activity description.');
-                  await context.emit('step', summary, { execution });
-                  return 'Status updated.';
-                },
-              }
-            : {}),
         },
         async () => {
           if (!browsed) await computer.hold(browserId, false).catch(() => {});
@@ -1056,8 +1046,11 @@ export function createAgentRuntime(dependencies: {
       await context.emit('agent_start', 'Main agent', { execution });
       const opening = agent.open({
         ...execution,
-        automatic: !context.currentMessageId,
-        ...(context.proactivity ? { restricted: true, restartable: !context.resumed } : {}),
+        ...(context.model ? { model: context.model } : {}),
+        automatic: Boolean(context.automatic),
+        contextRestart: context.contextRestart,
+        ...(context.proactivity ? { restricted: true } : {}),
+        newRequest: !context.resumed,
         ...(context.scheduleCache ? { scheduleCache: context.scheduleCache } : {}),
         ...(sessionId === threadId && !context.proactivity && dependencies.keepWarm
           ? { keepWarm: () => dependencies.keepWarm!(threadId) }
@@ -1145,6 +1138,7 @@ export function createAgentRuntime(dependencies: {
             completeStream();
             streamId = randomUUID();
             modelError = undefined;
+            contextExhausted = false;
           }
           if (event.type === 'message_end') {
             if (event.status === 'succeeded') {
@@ -1179,7 +1173,10 @@ export function createAgentRuntime(dependencies: {
             speakNext = false;
             completeStream();
           }
-          if (event.type === 'error') modelError = event.message;
+          if (event.type === 'error') {
+            modelError = event.message;
+            contextExhausted = event.contextExhausted === true;
+          }
           if (event.type === 'final') {
             modelError = undefined;
             modelIncomplete = undefined;
@@ -1211,7 +1208,7 @@ export function createAgentRuntime(dependencies: {
       session = await opening;
       signal.throwIfAborted();
       const resumed = session.resumed;
-      const compact = Boolean(session.contextWindow && session.contextWindow < 65_536);
+      const compact = session.compactContext === true;
       const { images, omitted, analysis } = await inline(context.attachments, context.prompt);
       const requestContext = compact
         ? {
@@ -1264,15 +1261,15 @@ export function createAgentRuntime(dependencies: {
       const paused = () =>
         `Paused at the ${dollars(context.checkIn!.budgetUsd)} check-in. Reply to keep going.`;
       if (modelError)
-        throw new ModelRequestError(
+        throw new (contextExhausted ? ContextLimitError : ModelRequestError)(
           `The model request failed: ${(dependencies.redactError ?? String)(modelError)}`,
         );
-      if (modelIncomplete && status === 'succeeded')
-        throw new Error(
-          modelIncomplete === 'context'
-            ? 'The model response was cut off because its context is full. Start a new conversation or choose a model with a larger context.'
-            : 'The model response was incomplete. Say continue to try again.',
+      if (modelIncomplete === 'context' && status === 'succeeded')
+        throw new ContextLimitError(
+          `The model response was cut off because its context is full. Choose a model with a larger context in ${appPages['/settings/models']}.`,
         );
+      if (modelIncomplete && status === 'succeeded')
+        throw new Error('The model response was incomplete. Say continue to try again.');
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');
       if (status === 'succeeded' && (context.proactivity ? overBudget() : checkInStopped)) {
         status = 'waiting_user';

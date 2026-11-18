@@ -13,6 +13,7 @@ import type {
 } from '../../shared/contracts';
 import type { SuggestedTask, TaskSuggestions } from '../../shared/onboarding';
 import type { TrustView } from '../../shared/trust';
+import { appPages } from '../../shared/app-links';
 import type { QuestionAnswer } from '../../shared/answer-choices';
 import { integrationMetadata, integrationServices } from '../../shared/integrations';
 import { moreIdeasLine } from '../../shared/sender-apps';
@@ -22,7 +23,7 @@ import { ChatTools } from '../components/chat-tools';
 import { ServiceLogo } from '../components/service-logo';
 import { Composer, type ComposerHandle, type ComposerSendResult } from '../components/composer';
 import { TaskCard } from './tasks';
-import { MessageBubble } from '../components/message';
+import { MessageBubble, type MessageWork } from '../components/message';
 import { conversationFiles } from '../components/attachment-card';
 import { ArtifactWorkspace } from '../components/artifact-drawer';
 import { PrivateEntryWorkspace } from '../components/private-entry';
@@ -30,6 +31,7 @@ import { ChatNotifications } from '../components/chat-notifications';
 import { BrandMark } from '../components/brand';
 import { FeedbackLauncher } from '../components/feedback-discovery';
 import { Button, Notice } from '../components/ui';
+import type { ModelSelection } from '../../shared/models';
 import { desktopSettingsAvailable } from '../lib/desktop';
 import { usePageData } from '../hooks/use-page-data';
 import { api, apiResponse, ApiError, errorMessage, post } from '../lib/api';
@@ -130,21 +132,32 @@ function Working({
   writing?: boolean;
   quiet?: boolean;
 }) {
-  const found = writing ? undefined : items.find((item) => !item.background && !item.taskId);
+  const found = items.find((item) => !item.background && !item.taskId);
   const chat = found?.doing === 'queued' ? undefined : found;
-  const thinking = Boolean(found) || (sending && !writing);
+  const thinking = !writing && (Boolean(found) || sending);
   const receipt = items.some((item) => !item.background && item.received)
     ? 'Got your message. I’ll read it after this step.'
     : null;
-  if (!thinking && !label && !receipt) return null;
+  if (!thinking && !label && !receipt && !found) return null;
   return (
-    <div className="thinking" role="status">
+    <div className="thinking" hidden={!thinking && !label && !receipt}>
       <NodGlyph size={28} mode="thinking" />
       <div className="working-details">
-        <span className="working-text">
-          {thinking ? <LiveLine item={chat} quiet={quiet} /> : (label ?? receipt)}
-        </span>
-        {thinking && receipt && <span className="working-receipt">{receipt}</span>}
+        <div className="working-text">
+          <div hidden={!thinking}>
+            <LiveLine item={chat} quiet={quiet && thinking} />
+          </div>
+          {!thinking && (
+            <span className="live-line-current" role="status">
+              {label ?? receipt}
+            </span>
+          )}
+        </div>
+        {thinking && receipt && (
+          <span className="working-receipt" role="status">
+            {receipt}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -333,7 +346,7 @@ export function Chat({
           : 'Choose a model to start chatting'}
       </h2>
       <Button variant="outline" asChild>
-        <a href="/settings/models">Open Settings &gt; Models</a>
+        <a href="/settings/models">Open {appPages['/settings/models']}</a>
       </Button>
     </div>
   );
@@ -357,6 +370,8 @@ export function Chat({
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [recovering, setRecovering] = useState(false);
+  const [recovered, setRecovered] = useState<string>();
   const [connectionNotice, setConnectionNotice] = useState<{
     text: string;
     kind: 'success' | 'error';
@@ -364,7 +379,7 @@ export function Chat({
   const [replyTo, setReplyTo] = useState<ComposerReply | null | undefined>(null);
   const [replyNotice, setReplyNotice] = useState('');
   const [unavailableQuestions, setUnavailableQuestions] = useState<ReadonlySet<string>>(new Set());
-  useEffect(() => setReplyNotice(''), [text, replyTo?.id]);
+  useEffect(() => setReplyNotice(''), [text, state.threadId]);
   const taskReply = useRef<string | null>(null);
   const [focusTarget, setFocusTarget] = useState<{
     id: string;
@@ -695,7 +710,60 @@ export function Chat({
   ];
   const live = state.activity ?? [];
   const working = live.some((item) => !item.background);
-  const chatWork = connected ? live.find((item) => !item.background && !item.taskId) : undefined;
+  const lastMessage = allMessages.at(-1);
+  const beforeLast = allMessages.at(-2);
+  const modelFailed =
+    lastMessage?.role === 'assistant' &&
+    lastMessage.id !== recovered &&
+    lastMessage.streamId?.startsWith('model-failure:') &&
+    beforeLast?.role === 'user' &&
+    beforeLast.turnId === lastMessage.turnId;
+  const failedRequest =
+    modelFailed &&
+    beforeLast &&
+    !beforeLast.attachments.length &&
+    !beforeLast.replyToMessageId &&
+    !beforeLast.choiceAnswer &&
+    !beforeLast.cardAnswer
+      ? beforeLast.text
+      : undefined;
+  const chatWork = connected
+    ? live.find((item) => !item.background && !item.taskId && !item.runId)
+    : undefined;
+  const workOf = (message: Message): MessageWork | undefined => {
+    const work = message.work;
+    if (!work) return undefined;
+    const item = live.find((entry) =>
+      work.kind === 'task' ? entry.taskId === work.id : entry.runId === work.id,
+    );
+    const task =
+      work.kind === 'task' ? state.tasks?.find((entry) => entry.id === work.id) : undefined;
+    return {
+      title: work.title,
+      status:
+        message.approval?.state === 'pending' || message.answerChoicesPending
+          ? 'needs_you'
+          : item
+            ? 'working'
+            : 'idle',
+      live: item,
+      ...(task?.messageId
+        ? {
+            onOpen: () => {
+              const opened = !window.dispatchEvent(
+                new CustomEvent('nod:open-task', { detail: { taskId: task.id }, cancelable: true }),
+              );
+              if (!opened)
+                window.dispatchEvent(
+                  new CustomEvent('nod:focus-message', {
+                    detail: { messageId: task.messageId, taskId: task.id },
+                  }),
+                );
+            },
+          }
+        : {}),
+    };
+  };
   const lastChatWork = useRef<{ threadId: string; item: Activity } | null>(null);
   if (chatWork) lastChatWork.current = { threadId, item: chatWork };
   const finishing = lastChatWork.current?.threadId === threadId ? lastChatWork.current.item : null;
@@ -1112,6 +1180,27 @@ export function Chat({
     setFocusTarget(null);
     setError('Could not find that message in this chat.');
   }, [focusTarget, loadingHistory, historyPage, hasEarlier, historyError, visible]);
+  async function recover(selection?: ModelSelection) {
+    setRecovering(true);
+    setRecovered(lastMessage?.id);
+    try {
+      if (selection)
+        await api('/api/models/selection', {
+          method: 'PUT',
+          body: JSON.stringify({
+            connectionId: selection.connectionId,
+            modelId: selection.modelId,
+            effort: selection.effort,
+          }),
+        });
+      if (failedRequest) await send(failedRequest, [], null);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setRecovering(false);
+    }
+  }
+
   async function send(
     value: string,
     attachments: Artifact[],
@@ -2183,6 +2272,7 @@ export function Chat({
                           ...(task.kind
                             ? { kind: task.kind === 'ongoing' ? 'ongoing' : 'immediate' }
                             : {}),
+                          origin: task.origin === 'common' ? 'common' : 'learned',
                           position,
                         });
                         void send(task.title, [], null, 'task_card');
@@ -2209,6 +2299,7 @@ export function Chat({
                   ) : (
                     <MessageBubble
                       message={message}
+                      work={workOf(message)}
                       answersDisabled={sending || !state.configuration.llmReady || welcoming}
                       onAnswer={async (value, answer) => {
                         if (replyTo?.id === message.id && composer.current?.hasDraft()) {
@@ -2393,12 +2484,82 @@ export function Chat({
               {replyNotice}
             </Notice>
           )}
+          {state.chatRecovery && (
+            <Notice kind="info">
+              <div className="chat-recovery">
+                <span>This chat needs a restart. Your messages, files and tasks stay.</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!connected || sending || Boolean(chatWork) || recovering}
+                  onClick={async () => {
+                    const expectedThread = threadId;
+                    setRecovering(true);
+                    setError('');
+                    try {
+                      await post('/api/conversation/restart-context', {
+                        threadId,
+                        turnId: state.chatRecovery!.turnId,
+                      });
+                      await refresh();
+                      if (threadRef.current === expectedThread) {
+                        setReplyTo(null);
+                        setReplyNotice('Chat restarted. Send your request again.');
+                        composer.current?.focus();
+                      }
+                    } catch (cause) {
+                      if (threadRef.current === expectedThread) setError(errorMessage(cause));
+                    } finally {
+                      setRecovering(false);
+                    }
+                  }}
+                >
+                  {recovering ? 'Restarting…' : 'Restart chat'}
+                </Button>
+              </div>
+            </Notice>
+          )}
           {error && <Notice>{error}</Notice>}
           {connectionNotice && (
             <Notice kind={connectionNotice.kind} onDismiss={() => setConnectionNotice(null)}>
               {connectionNotice.text}
             </Notice>
           )}
+          {state.configuration.llmReady &&
+            !state.chatRecovery &&
+            (state.configuration.modelIssue ||
+              (modelFailed && (failedRequest || state.configuration.modelAlternative))) && (
+              <Notice kind="info">
+                {state.configuration.modelIssue
+                  ? `Your model’s last request failed: ${state.configuration.modelIssue.reason.replace(/(?<![.!?])$/, '.')}`
+                  : 'Your model’s last request failed.'}
+                <span className="notice-actions">
+                  {state.configuration.modelAlternative && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      disabled={recovering || working || sending}
+                      onClick={() => void recover(state.configuration.modelAlternative)}
+                    >
+                      Use {state.configuration.modelAlternative.label}
+                    </Button>
+                  )}
+                  {failedRequest && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={recovering || working || sending}
+                      onClick={() => void recover()}
+                    >
+                      Try again
+                    </Button>
+                  )}
+                  <a href="/settings/models">{appPages['/settings/models']}</a>
+                </span>
+              </Notice>
+            )}
           {spendingPaused && trust?.limit && (
             <Notice kind="info">
               You reached your {money(trust.limit.monthlyUsd)} monthly spending limit. Raise or
@@ -2420,7 +2581,7 @@ export function Chat({
               restoreReply={(saved) => {
                 if (!saved || !hiddenMessageIds.current.has(saved.id)) setReplyTo(saved);
               }}
-              ready={state.configuration.llmReady && !welcoming}
+              ready={state.configuration.llmReady && !welcoming && !recovering}
               busy={connected && working}
               text={text}
               setText={setText}

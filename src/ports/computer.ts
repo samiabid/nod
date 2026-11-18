@@ -201,6 +201,12 @@ export interface ConnectedCli {
   command: string;
   source: CliSource;
 }
+export interface ConnectedCliResult {
+  exitCode: number;
+  output: string;
+  stdout?: string;
+  stderr?: string;
+}
 export interface WorkspaceSession {
   path: string;
   instructions: string;
@@ -210,7 +216,7 @@ export interface WorkspaceSession {
     args: string[],
     environment: Record<string, string>,
     timeoutSeconds?: number,
-  ): Promise<{ exitCode: number; output: string }>;
+  ): Promise<ConnectedCliResult>;
 }
 export interface Workspace {
   connectedCliAvailable?: boolean;

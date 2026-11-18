@@ -132,6 +132,16 @@ const flightsPresentation = z.strictObject({
     .max(8),
 });
 
+const bugReportPresentation = z.strictObject({
+  ...common,
+  type: z.literal('bug-report'),
+  draftId: z.uuid(),
+  summary: text(4000),
+});
+
+export const bugReportReplyHint =
+  'Reply "send" to share this summary with the Nod team, or ignore it. To add a diagnostic report, send it from Nod on your computer.';
+
 export const presentationSchema = z
   .discriminatedUnion('type', [
     z.strictObject({
@@ -239,6 +249,7 @@ export const presentationSchema = z
         .max(20),
       edges: z.array(z.strictObject({ from: id, to: id, label: text(120).optional() })).max(32),
     }),
+    bugReportPresentation,
   ])
   .superRefine((value, context) => {
     const invalid = (message: string) => context.addIssue({ code: 'custom', message });
@@ -346,7 +357,9 @@ export const presentationInputSchema = z
         .min(1)
         .max(8),
     }),
-    ...presentationSchema.options.filter((schema) => schema !== flightsPresentation),
+    ...presentationSchema.options.filter(
+      (schema) => schema !== flightsPresentation && schema !== bugReportPresentation,
+    ),
   ])
   .pipe(presentationSchema);
 
@@ -395,6 +408,7 @@ export function presentationText(value: Presentation) {
   if (value.asOf) lines.push(value.asOf);
   if (value.type === 'image') lines.push(value.alt);
   if (value.type === 'apps') lines.push(`Connect in Apps: ${value.services.join(', ')}`);
+  if (value.type === 'bug-report') lines.push(value.summary, '', bugReportReplyHint);
   if (value.type === 'map')
     for (const place of value.places)
       lines.push(

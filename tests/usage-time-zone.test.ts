@@ -109,7 +109,10 @@ test('Usage uses the computer time zone for activity and opened logs', async (t)
   };
   const data = new Map<string, unknown>([
     ['/api/trust', view],
-    ['/api/models', { connections: [], selection: null } satisfies ModelsResponse],
+    [
+      '/api/models',
+      { connections: [], selection: null, routes: {}, light: null } satisfies ModelsResponse,
+    ],
     ['/api/vault/activity', vault],
     ['/api/vault', []],
     ['/api/vault/sessions', []],

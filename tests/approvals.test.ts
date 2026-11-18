@@ -25,6 +25,7 @@ import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import type { ProductAnalytics } from '../src/ports/analytics.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
+import { IntegrationConnectionError } from '../src/ports/integrations.ts';
 import { createAnalytics, snapshotAnalytics } from '../src/server/analytics.ts';
 import {
   accessCookie,
@@ -44,7 +45,9 @@ import {
 import { createCommunication } from '../src/server/communication.ts';
 import { ApprovalCard, ApprovalChoiceCard } from '../src/web/components/action-card.tsx';
 import { createE2eCurators } from '../scripts/e2e-curators.ts';
+import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { createPiMemoryCurator } from '../src/providers/pi/memory-curator.ts';
+import { createIntegrations } from '../src/server/integrations.ts';
 
 function markdownNodes(markdown: string) {
   const tree = unified().use(remarkParse).use(remarkGfm).parse(markdown);
@@ -213,6 +216,68 @@ test('browser confirmation uses the page as context without displaying its actio
     result.question,
     /NOD_browser|@e17|Entered values|synthetic-secret|private-binding/,
   );
+});
+
+test('a complete schedule approval refuses a definition with hidden values', async () => {
+  let calls = 0;
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      calls++;
+      return { text: 'Approve the synthetic schedule?', action: 'Save schedule' };
+    },
+  });
+  await assert.rejects(
+    communication.describe({
+      turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+      action: 'NOD_schedule_create',
+      args: { prompt: 'Read the synthetic board.' },
+      details: {
+        scheduleDefinition: { prompt: 'Read the synthetic board.', api_key: 'synthetic-secret' },
+      },
+    }),
+    /complete schedule instruction has hidden values/,
+  );
+  assert.equal(calls, 0);
+});
+
+test('a complete schedule approval keeps ordinary text and still hides Basic credentials', async () => {
+  let calls = 0;
+  const prompt = 'Prepare a basic daily briefing from https://shop.example.test/payments/';
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async (_instructions, input) => {
+      calls++;
+      const request = input as Record<string, any>;
+      assert.equal(request.data.details.scheduleDefinition.prompt, prompt);
+      return request.purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Save the basic daily briefing schedule for the shop?', action: 'Save schedule' };
+    },
+  });
+  const proposal = {
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    action: 'NOD_schedule_create',
+    args: { prompt },
+    details: { scheduleDefinition: { prompt } },
+  };
+  await communication.describe(proposal);
+  assert.equal(calls, 2);
+  const credential = Buffer.from('synthetic-user:synthetic-password!').toString('base64');
+  for (const token of [credential, credential.replace(/=+$/u, '')]) {
+    await assert.rejects(
+      communication.describe({
+        ...proposal,
+        details: {
+          scheduleDefinition: { prompt: `Use Basic ${token}` },
+        },
+      }),
+      /hidden values/,
+    );
+  }
+  assert.equal(calls, 2);
 });
 
 test('browser upload wording omits the private workspace path', async () => {
@@ -596,6 +661,11 @@ test('server configuration refuses remote exposure without a valid token and an 
     ' https://nod.example',
     'https://nod.example\n',
     'file:///tmp/nod',
+    'https://nod.example:443/assistant',
+    'https://nod.example:443?token=secret',
+    'https://nod.example:443#token',
+    'https://user:password@nod.example:443',
+    'http://nod.example:80',
   ])
     assert.throws(() => serverNetwork({ NOD_PUBLIC_URL, NOD_AUTH_TOKEN: key }));
   const remote = serverNetwork({
@@ -615,7 +685,23 @@ test('server configuration refuses remote exposure without a valid token and an 
     'http://[::1]:4310',
   ])
     assert.equal(serverNetwork({ NOD_PUBLIC_URL }).publicOrigin, NOD_PUBLIC_URL);
+  for (const NOD_PUBLIC_URL of ['https://nod.example:443', 'https://nod.example:443/']) {
+    const defaultPort = serverNetwork({ NOD_PUBLIC_URL, NOD_AUTH_TOKEN: key });
+    assert.equal(defaultPort.publicOrigin, 'https://nod.example');
+    assert.equal(defaultPort.accessOrigin, 'https://nod.example');
+  }
+  for (const NOD_PUBLIC_URL of ['http://localhost:80', 'http://127.0.0.1:80', 'http://[::1]:80'])
+    assert.equal(
+      serverNetwork({ NOD_PUBLIC_URL }).publicOrigin,
+      NOD_PUBLIC_URL.replace(/:80$/, ''),
+    );
   assert.equal(serverNetwork({}).accessOrigin, undefined);
+  assert.equal(serverNetwork({ NOD_AUTH_TOKEN: key }).accessOrigin, undefined);
+  for (const environment of [{ PORT: '80' }, { PORT: '80', NOD_AUTH_TOKEN: key }]) {
+    const defaultPort = serverNetwork(environment);
+    assert.equal(defaultPort.publicOrigin, 'http://localhost');
+    assert.equal(defaultPort.accessOrigin, undefined);
+  }
   assert.equal(serverNetwork({ NOD_DESKTOP: 'true', NOD_AUTH_TOKEN: '' }).authToken, undefined);
 });
 
@@ -727,6 +813,43 @@ test('remote access authenticates cookies and bearer clients only on the configu
     assert.equal((await rotated.inject({ url: '/api/fixture', headers })).statusCode, 401);
 });
 
+test('a server token alone keeps every local address and still refuses a foreign Host', async (t) => {
+  const key = randomBytes(32).toString('base64url');
+  const network = serverNetwork({ NOD_AUTH_TOKEN: key });
+  const app = Fastify({ trustProxy: false });
+  t.after(() => app.close());
+  registerLocalAccess(app, network.port, { key, origin: network.accessOrigin, bearer: true });
+  app.get('/api/privacy', async () => ({ content: null }));
+  for (const host of ['localhost:4310', '127.0.0.1:4310', '[::1]:4310'])
+    assert.equal((await app.inject({ url: '/api/privacy', headers: { host } })).statusCode, 200);
+  assert.equal(
+    (await app.inject({ url: '/api/privacy', headers: { host: 'nod.example' } })).statusCode,
+    403,
+  );
+  const defaultPort = Fastify({ trustProxy: false });
+  t.after(() => defaultPort.close());
+  registerLocalAccess(defaultPort, 80, { key, bearer: true });
+  defaultPort.get('/api/privacy', async () => ({ content: null }));
+  for (const [host, status] of [
+    ['localhost', 200],
+    ['127.0.0.1', 200],
+    ['[::1]', 200],
+    ['localhost:4310', 403],
+  ] as const)
+    assert.equal(
+      (await defaultPort.inject({ url: '/api/privacy', headers: { host } })).statusCode,
+      status,
+    );
+  assert.equal(
+    (
+      await defaultPort.inject({
+        url: '/api/privacy',
+        headers: { host: 'localhost', origin: 'http://localhost' },
+      })
+    ).statusCode,
+    200,
+  );
+});
 test('localhost access requires the owner key and rejects foreign Host, Origin and cross-site requests', async () => {
   const root = await mkdtemp(join(tmpdir(), 'nod-access-'));
   const app = Fastify();
@@ -1034,6 +1157,23 @@ test(
       const submitted = await thread.submitUserMessage(prompt, [], { channel: options.channel });
       return running(submitted.turnId);
     };
+    const attachSchedule = async (
+      turn: { turnId: string; threadId: string },
+      instruction = 'Read the synthetic board.',
+    ) => {
+      await db.pool.query(
+        "INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority) VALUES($1,$2,$3,0,$4,'Synthetic schedule',$5,now(),'UTC',$6)",
+        [
+          randomUUID(),
+          ownerId,
+          randomUUID(),
+          randomUUID(),
+          turn.turnId,
+          { messages: [{ id: null, at: new Date().toISOString(), text: instruction }] },
+        ],
+      );
+      return turn;
+    };
     const finish = (turnId: string, status = 'waiting') =>
       db.pool.query('UPDATE turns SET status=$2,finished_at=now() WHERE id=$1', [turnId, status]);
     const proposal = async (turnId: string) =>
@@ -1156,7 +1296,7 @@ test(
       let ruled = false;
       const cite = (input: Record<string, any>) =>
         input.userMessages?.at(-1)?.text ??
-        input.scheduledTaskInstruction ??
+        input.scheduledInstructions?.[0]?.text ??
         input.standingInstruction ??
         input.userRules ??
         'read';
@@ -1301,6 +1441,58 @@ test(
         });
         return { promise, resolve };
       };
+      for (const [status, code] of [
+        [429, 'installation_busy'],
+        [503, 'service_unavailable'],
+      ] as const) {
+        await t.test(
+          `a ${status} during session creation expires the approved app action`,
+          async (t) => {
+            const fixture = createIntegrationFixture(`http://localhost:${port}`);
+            let sessions = 0;
+            const integrations = await createIntegrations(db.pool, {
+              ownerId,
+              baseUrl: `http://localhost:${port}`,
+              wake: async () => {},
+              provider: {
+                ...fixture.provider,
+                createSession: async () => {
+                  sessions++;
+                  throw new IntegrationConnectionError(
+                    status === 429 ? 'rate_limit' : 'unavailable',
+                    'session',
+                    status,
+                    code,
+                  );
+                },
+              },
+            });
+            const connectionId = randomUUID();
+            await db.pool.query(
+              "INSERT INTO app_connections(id,owner_id,slug,provider_id,account_id) VALUES($1,$2,'gmail',$3,'synthetic-account')",
+              [connectionId, ownerId, fixture.provider.id],
+            );
+            t.after(async () => {
+              executionResult = undefined;
+              await db.pool.query('DELETE FROM app_connections WHERE id=$1', [connectionId]);
+            });
+            const turn = await begin('Synthetic session refusal');
+            const args = { ...email('session-refusal@example.test'), connectionId };
+            const approvalId = await propose(turn, 'GMAIL_SEND_EMAIL', args);
+            await finish(turn.turnId);
+            const confirmed = await confirm(approvalId, true);
+            assert.ok(confirmed && 'turnId' in confirmed);
+            assert.equal((await stored(approvalId)).status, 'confirmed');
+            executionResult = () => integrations.execute(ownerId, 'GMAIL_SEND_EMAIL', args);
+            const result = await execute(approvalId);
+            assert.equal((await stored(approvalId)).status, 'expired');
+            assert.match(result?.prompt ?? '', /did not run/);
+            assert.equal(sessions, 1);
+            assert.equal(fixture.writes.length, 0);
+            await finish(confirmed.turnId, 'succeeded');
+          },
+        );
+      }
       await t.test(
         'one authorization review preserves the original instructions and executed arguments',
         async () => {
@@ -1521,6 +1713,50 @@ test(
         assert.deepEqual(unusable(), []);
         await finish(declined.turnId, 'cancelled');
       });
+
+      await t.test(
+        'a browser step quoted from informal owner words runs, and uncovered steps still ask',
+        async () => {
+          const request =
+            'no brecho.example.test clica no icone de lapis do anuncio da luminaria, muda o preço p 90 e salva as alteraçoes';
+          const step = (name: string) => ({
+            website: 'https://brecho.example.test',
+            page: 'https://brecho.example.test/minha-loja/anuncios',
+            step: 'click',
+            control: [{ role: 'button', name }],
+            command: { action: 'click', selector: '@e12' },
+          });
+          const turn = await begin(request);
+          for (const because of [
+            '...clica no icone de lapis do anuncio da luminaria',
+            '…salva as alteraçoes',
+            'clica no ícone de lápis do anúncio da luminária',
+            'salva as alterações',
+          ]) {
+            aligned = () => ({ run: true, because });
+            const verdict = await trust.check(turn, 'NOD_browser', step('editar anúncio'));
+            assert.equal(verdict.confirm, false, because);
+            assert.equal(!verdict.confirm && verdict.basis.kind, 'message', because);
+          }
+          for (const because of [
+            'clica no ícone ... salva as alterações',
+            'apaga o anúncio da luminária',
+            '...',
+          ]) {
+            aligned = () => ({ run: true, because });
+            compareVerdict(await trust.check(turn, 'NOD_browser', step('apagar anúncio')), {
+              confirm: true,
+              reason: 'unrequested',
+            });
+          }
+          aligned = false;
+          compareVerdict(await trust.check(turn, 'NOD_browser', step('apagar anúncio')), {
+            confirm: true,
+            reason: 'unrequested',
+          });
+          await finish(turn.turnId, 'cancelled');
+        },
+      );
 
       await t.test('a newer chat correction before action handoff prevents the write', async () => {
         aligned = true;
@@ -2564,7 +2800,7 @@ test(
             { confirm: true, reason: 'background' },
           );
           assert.equal(reviews.at(-1)?.userMessages, undefined);
-          assert.equal(reviews.at(-1)?.scheduledTaskInstruction, undefined);
+          assert.equal(reviews.at(-1)?.scheduledInstructions, undefined);
           assert.equal(reviews.at(-1)?.standingInstruction, undefined);
           const standing = 'Whenever Ana sends an invoice, forward it to accounting@example.test.';
           await setRule(standing);
@@ -2580,13 +2816,15 @@ test(
           await trust.check(await begin('Check my inbox.'), 'GMAIL_FETCH_EMAILS', {});
           assert.equal(reviews.at(-1)?.standingInstruction, undefined);
           const scheduled = await begin('Synthetic scheduled work', { source: 'schedule' });
-          compareVerdict(
-            await trust.check(scheduled, 'GOOGLECALENDAR_PATCH_EVENT', {
+          const beforeMissing = reviews.length;
+          await assert.rejects(
+            trust.check(scheduled, 'GOOGLECALENDAR_PATCH_EVENT', {
               event_id: 'synthetic-shared',
               start_time: '10:00',
             }),
-            { confirm: true, reason: 'schedule' },
+            /no saved owner instruction/,
           );
+          assert.equal(reviews.length, beforeMissing);
           const instruction = 'Every Monday, move the synthetic standup to 10:00.';
           const authorized = await begin('Synthetic scheduled work', { source: 'schedule' });
           const scheduleId = randomUUID();
@@ -2596,12 +2834,12 @@ test(
             [scheduleId, ownerId],
           );
           await db.pool.query(
-            `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority_instruction)
-             VALUES($1,$2,$3,1,$4,'Synthetic standup',$5,'2026-10-19T07:00:00Z','Europe/Madrid',$6)`,
+            `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority)
+             VALUES($1,$2,$3,1,$4,'Synthetic standup',$5,'2026-10-19T07:00:00Z','Europe/Madrid',jsonb_build_object('messages',jsonb_build_array(jsonb_build_object('id',null,'at',now(),'text',$6::text))))`,
             [randomUUID(), ownerId, scheduleId, randomUUID(), authorized.turnId, instruction],
           );
           aligned = (input) =>
-            input.scheduledTaskInstruction === instruction &&
+            input.scheduledInstructions?.[0]?.text === instruction &&
             input.scheduledFor === '2026-10-19T09:00:00+02:00' &&
             input.timeZone === 'Europe/Madrid';
           compareVerdict(
@@ -2648,6 +2886,348 @@ test(
       );
 
       await t.test(
+        'a complete replacement approval repairs withdrawn schedule evidence once',
+        async () => {
+          const descriptions: ApprovalDescription[] = [];
+          let writes = 0;
+          const scoped = await createApprovals(
+            async (action, args, context) =>
+              thread.withTurnLock(context.turnId, async (client) => {
+                const value = await personal.manage(action.slice('NOD_'.length), args, context, {
+                  client,
+                });
+                writes++;
+                return value;
+              }),
+            async (action, args, revision, client) => {
+              await personal.validateReview(action.slice('NOD_'.length), args, revision, client);
+            },
+            async (reply) => reply === 'Yes',
+            async (proposal) => {
+              descriptions.push(proposal);
+              return 'Approve the complete synthetic schedule instruction?';
+            },
+          );
+          const owner = await begin('Each Friday, read the synthetic board. Never send email.');
+          const args = {
+            title: 'Synthetic source repair',
+            prompt: 'Read the synthetic board. Never send email.',
+            kind: 'recurring',
+            cron: '0 9 * * 5',
+            timeZone: 'UTC',
+          };
+          aligned = true;
+          const initial = await trust.check(
+            owner,
+            'NOD_schedule_create',
+            args,
+            undefined,
+            await personal.prepareScheduleChange('schedule_create', args),
+          );
+          assert.equal(initial.confirm, false);
+          const created = (await scoped.request(owner, 'NOD_schedule_create', args, {
+            allowed: true,
+            instructionChange: initial.instructionChange,
+          })) as { id: string };
+          const originalMessage = (await row(owner.turnId)).message_id;
+          await db.pool.query('UPDATE turns SET withdrawn=true WHERE id=$1', [owner.turnId]);
+          const changed = await begin(
+            'Replace the complete instruction: read the synthetic archive every Friday and summarize it in Nod. Never send email.',
+          );
+          const patch = {
+            id: created.id,
+            prompt:
+              'Read the synthetic archive every Friday and summarize it in Nod. Never send email.',
+          };
+          const prepared = await personal.prepareScheduleChange('schedule_update', patch);
+          const before = reviews.length;
+          const checked = await trust.check(
+            changed,
+            'NOD_schedule_update',
+            patch,
+            undefined,
+            prepared,
+          );
+          assert.equal(checked.confirm, true);
+          assert.equal(reviews.length, before);
+          assert.equal(checked.instructionChange?.previousEvidence, undefined);
+          await scoped.request(changed, 'NOD_schedule_update', patch, {
+            allowed: false,
+            instructionChange: checked.instructionChange,
+            expectedRevision: prepared.revision,
+          });
+          const pending = (
+            await db.pool.query('SELECT * FROM approvals WHERE turn_id=$1', [changed.turnId])
+          ).rows[0];
+          assert.deepEqual(
+            descriptions.at(-1)?.details?.scheduleDefinition,
+            pending.instruction_change.after,
+          );
+          assert.ok(!JSON.stringify(pending.instruction_change.evidence).includes(originalMessage));
+          await finish(changed.turnId);
+          const input = {
+            text: 'Yes',
+            channel: 'web',
+            threadId: changed.threadId,
+            replyToMessageId: pending.confirmation_message_id,
+            clientMessageId: randomUUID(),
+          };
+          const answer = await scoped.chat.answer(input);
+          const resumed = await transaction(
+            (client) => scoped.chat.accept(client, { ...input, answer }),
+            db.pool,
+          );
+          assert.ok(resumed && 'turnId' in resumed);
+          await running(resumed.turnId);
+          await scoped.executeConfirmed(resumed.turnId, new AbortController().signal);
+          assert.equal((await stored(pending.id)).status, 'completed');
+          const authority = (
+            await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [created.id])
+          ).rows[0].authority;
+          assert.deepEqual(authority.messages, []);
+          assert.equal(authority.approvals[0].id, pending.id);
+          assert.equal(authority.approvals[0].definition.prompt, patch.prompt);
+          assert.equal(
+            await scoped.executeConfirmed(resumed.turnId, new AbortController().signal),
+            undefined,
+          );
+          assert.equal(writes, 2);
+        },
+      );
+      await t.test(
+        'all checker modes receive the same scheduled evidence without internal IDs',
+        async () => {
+          const owner = await begin('Read the synthetic board each morning.');
+          const ownerMessage = (await row(owner.turnId)).message_id;
+          const context = await begin('The synthetic board is in Documents/board.');
+          const contextMessage = (await row(context.turnId)).message_id;
+          const scheduled = await begin('Synthetic scheduled check.', { source: 'schedule' });
+          const authority = {
+            messages: [
+              {
+                id: contextMessage,
+                at: '2026-11-13T09:00:00Z',
+                text: 'The synthetic board is in Documents/board.',
+                canAuthorize: false,
+              },
+              {
+                id: ownerMessage,
+                at: '2026-11-14T09:00:00Z',
+                text: 'Read the synthetic board each morning.',
+              },
+            ],
+            approvals: [
+              {
+                id: randomUUID(),
+                at: '2026-11-14T09:00:00Z',
+                definition: { prompt: 'Read Documents/board/todo.md.' },
+              },
+            ],
+          };
+          await db.pool.query(
+            `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority) VALUES($1,$2,$3,0,$4,'Synthetic wire check',$5,now(),'UTC',$6)`,
+            [
+              randomUUID(),
+              ownerId,
+              randomUUID(),
+              randomUUID(),
+              scheduled.turnId,
+              JSON.stringify(authority),
+            ],
+          );
+          const inputs: Array<Record<string, any>> = [];
+          for (const mode of ['llm', 'decision', 'jev']) {
+            const checker = createTrust({
+              pool: db.pool,
+              ownerId,
+              review: async (_instructions, input) => {
+                inputs.push(input);
+                return { run: false };
+              },
+              ...(mode === 'llm'
+                ? {}
+                : {
+                    decisions: {
+                      async check(request) {
+                        const wire =
+                          request.forModel?.(
+                            mode === 'jev'
+                              ? { provider: 'typesafe', model: 'jev-1.14.0' }
+                              : { provider: 'openai', model: 'decisions' },
+                          ) ?? request;
+                        inputs.push(wire.input);
+                        return { refused: true };
+                      },
+                    },
+                  }),
+            });
+            if (mode === 'llm')
+              assert.equal(
+                (
+                  await checker.check(scheduled, 'LOCAL_FILES_READ', {
+                    path: '/Users/ana/Documents/board/todo.md',
+                  })
+                ).confirm,
+                true,
+              );
+            else
+              await assert.rejects(
+                checker.check(scheduled, 'LOCAL_FILES_READ', {
+                  path: '/Users/ana/Documents/board/todo.md',
+                }),
+              );
+            await checker.check(
+              owner,
+              'NOD_schedule_update',
+              { title: 'Synthetic renamed board' },
+              undefined,
+              {
+                before: authority.approvals[0].definition,
+                changes: { title: 'Synthetic renamed board' },
+                after: { ...authority.approvals[0].definition, title: 'Synthetic renamed board' },
+                evidence: authority,
+              },
+            );
+          }
+          for (const input of inputs.filter((value) => value.scheduledInstructions)) {
+            assert.equal(input.scheduledInstructions[0].canAuthorize, false);
+            assert.equal(input.scheduledInstructions[1].at, '2026-11-14T09:00:00Z');
+            assert.deepEqual(input.scheduledApproval, {
+              definition: authority.approvals[0].definition,
+              at: authority.approvals[0].at,
+            });
+            assert.ok(!JSON.stringify(input).includes(ownerMessage));
+            assert.ok(!JSON.stringify(input).includes(contextMessage));
+            assert.ok(!JSON.stringify(input).includes(authority.approvals[0].id));
+          }
+          for (const input of inputs.filter((value) => value.instructionChange)) {
+            assert.deepEqual(input.instructionChange.previousApproval, {
+              definition: authority.approvals[0].definition,
+              at: authority.approvals[0].at,
+            });
+            assert.equal(input.instructionChange.previousInstructions[0].canAuthorize, false);
+            assert.ok(!JSON.stringify(input).includes(authority.approvals[0].id));
+            assert.ok(!JSON.stringify(input).includes(ownerMessage));
+            assert.ok(!JSON.stringify(input).includes(contextMessage));
+          }
+          assert.equal(inputs.length, 6);
+        },
+      );
+      await t.test(
+        'a prepared instruction change refuses a newer owner request before execution',
+        async () => {
+          const response = await app.inject({
+            method: 'POST',
+            url: '/api/schedules',
+            headers,
+            payload: {
+              title: 'Synthetic race',
+              prompt: 'Read the synthetic board. Never send email.',
+              kind: 'once',
+              runAt: '2099-01-01T09:00:00Z',
+              timeZone: 'UTC',
+            },
+          });
+          assert.equal(response.statusCode, 200, response.body);
+          const id = response.json().id;
+          const turn = await begin('Rename the synthetic board check.');
+          const prepared = await personal.prepareScheduleChange('schedule_update', {
+            id,
+            title: 'Synthetic renamed board',
+          });
+          aligned = true;
+          const verdict = await trust.check(
+            turn,
+            'NOD_schedule_update',
+            { id, title: 'Synthetic renamed board' },
+            undefined,
+            prepared,
+          );
+          assert.equal(verdict.confirm, false);
+          const before = calls.length;
+          await begin('Keep the original name instead.');
+          await assert.rejects(
+            approvals.request(
+              turn,
+              'NOD_schedule_update',
+              { id, title: 'Synthetic renamed board' },
+              { allowed: true, instructionChange: verdict.instructionChange },
+            ),
+            /owner changed this request/,
+          );
+          assert.equal(calls.length, before);
+          assert.equal((await personal.getSchedule(id)).title, 'Synthetic race');
+        },
+      );
+      await t.test('a queued task correction refuses a prepared schedule write', async (t) => {
+        const parent = await begin('Read the synthetic board each Friday. Never send email.');
+        t.after(() => finish(parent.turnId, 'cancelled'));
+        const task = (await tasks.execute(
+          parent,
+          {
+            action: 'start',
+            title: 'Synthetic schedule task',
+            message: 'Set up the synthetic board check.',
+            doneWhen: 'The schedule is saved.',
+            now: 'Prepare the schedule.',
+          },
+          (await row(parent.turnId)).message_id,
+        )) as { id: string };
+        t.after(async () => {
+          await db.pool.query(
+            "UPDATE turns SET task_id=NULL,status='cancelled',finished_at=now() WHERE task_id=$1",
+            [task.id],
+          );
+          await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+        });
+        await finish(parent.turnId, 'succeeded');
+        const worker = await running(
+          (
+            await db.pool.query("SELECT id FROM turns WHERE task_id=$1 AND source='task'", [
+              task.id,
+            ])
+          ).rows[0].id,
+        );
+        await tasks.inherit(worker);
+        const args = {
+          title: 'Synthetic queued correction',
+          prompt: 'Read the synthetic board. Never send email.',
+          kind: 'recurring',
+          cron: '0 9 * * 5',
+          timeZone: 'UTC',
+        };
+        aligned = true;
+        const verdict = await trust.check(
+          worker,
+          'NOD_schedule_create',
+          args,
+          undefined,
+          await personal.prepareScheduleChange('schedule_create', args),
+        );
+        assert.equal(verdict.confirm, false);
+        assert.equal(verdict.instructionChange?.task?.id, task.id);
+        const update = await begin('Do not create a schedule. Only summarize the board now.');
+        t.after(() => finish(update.turnId, 'cancelled'));
+        await tasks.execute(
+          update,
+          { action: 'reply', ids: [task.id] },
+          (await row(update.turnId)).message_id,
+        );
+        const before = calls.length;
+        await assert.rejects(
+          approvals.request(worker, 'NOD_schedule_create', args, {
+            allowed: true,
+            instructionChange: verdict.instructionChange,
+          }),
+          /owner changed this task/,
+        );
+        assert.equal(calls.length, before);
+        assert.deepEqual(
+          (await db.pool.query('SELECT id FROM approvals WHERE turn_id=$1', [worker.turnId])).rows,
+          [],
+        );
+      });
+      await t.test(
         'owner rules reach the checker in chat, scheduled and background work, only owners with rules get the rules prompt, and only a real rule is named as the reason to ask',
         async () => {
           const setRules = (rules: string) =>
@@ -2676,7 +3256,7 @@ test(
           for (const turn of [
             chat,
             await begin('Synthetic event', { source: 'event' }),
-            await begin('Synthetic scheduled work', { source: 'schedule' }),
+            await attachSchedule(await begin('Synthetic scheduled work', { source: 'schedule' })),
           ]) {
             compareVerdict(await trust.check(turn, 'GMAIL_SEND_EMAIL', send), {
               confirm: true,
@@ -3358,7 +3938,9 @@ test(
           const args = { id: randomUUID() };
           const turns = await Promise.all([
             begin('A synthetic event proposes a pause.', { source: 'event' }),
-            begin('A synthetic scheduled check proposes a pause.', { source: 'schedule' }),
+            begin('A synthetic scheduled check proposes a pause.', { source: 'schedule' }).then(
+              attachSchedule,
+            ),
           ]);
           const before = calls.length;
           const results = await Promise.all(

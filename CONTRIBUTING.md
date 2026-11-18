@@ -6,10 +6,12 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to help
 
+- **Create an app connector.** Follow [Creating your own connectors](docs/src/content/docs/contribute/apps/index.md) for MCP, HTTP API, and CLI formats, the AI builder skill, required tests, and approval process. Browse [custom connections](https://nod.n8n.io/docs/connect/community-apps/) for examples.
+
 - **Report a bug** with the [bug report form](https://github.com/n8n-io/nod/issues/new/choose).
 - **Ask a question or share an idea** in [Discussions](https://github.com/n8n-io/nod/discussions).
 - **Report a vulnerability** privately, as described in the [security policy](SECURITY.md). Never in a public issue.
-- **Send a pull request.** For anything larger than a small fix, open an issue or discussion first.
+- **Send a pull request.** App-only contributions that use the supported profile follow the app guide. For other work larger than a small fix, open an issue or discussion first.
 
 ## Set up and check
 

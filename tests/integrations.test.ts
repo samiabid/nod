@@ -11,7 +11,19 @@ import {
   verify,
   webcrypto,
 } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, readdir, rm, stat, symlink } from 'node:fs/promises';
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  cp,
+  readFile,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -44,16 +56,23 @@ import {
 } from '../src/ports/integrations.ts';
 import { createComposioProvider } from '../src/providers/composio/integrations.ts';
 import { createComposioProxy } from '../src/providers/composio/proxy.ts';
+import { logFailure, withFailureLog } from '../src/server/failure-log.ts';
 import { serviceEnvironment } from '../src/providers/process.ts';
 import { createIntegrationIdentityCheckpoint } from '../src/server/integration-identity.ts';
 import { createIntegrationBrowser } from '../src/server/integration-browser.ts';
-import { createDiscoveredTransport, safeRemoteFetch } from '../src/providers/discovered/remote.ts';
+import {
+  createDiscoveredTransport,
+  ownerAddress,
+  safeRemoteFetch,
+} from '../src/providers/discovered/remote.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
+import { createDiscoveredOAuth } from '../src/providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from '../src/server/discovered-connections.ts';
 import { registerLocalAccess } from '../src/server/access.ts';
 import { createIntegrations, initializeIntegrationSchema } from '../src/server/integrations.ts';
 import { cachedIcons } from '../src/server/link-previews.ts';
 import { createErrorRedactor } from '../src/server/redaction.ts';
+import { createFeedbackRedactor } from '../src/server/feedback-redaction.ts';
 import { createLedger } from '../src/server/ledger.ts';
 import { createActivityLog } from '../src/server/activity-log.ts';
 import { createVaultAccess } from '../src/server/vault-access.ts';
@@ -66,6 +85,1199 @@ import { connectedGmail } from '../src/shared/onboarding.ts';
 import { fileBytes } from '../src/shared/files.ts';
 import { connectionGroups } from '../src/web/lib/secondary-pages.ts';
 import { fakeComputer, fakeExecution, fakeWorkspace } from './runtime-fixtures.ts';
+import { appAccessPath, bundledApps, loadAppCatalog } from '../src/server/app-catalog.ts';
+import { appAccessSchema } from '../src/server/app-access.ts';
+import { checkAppContract } from '../scripts/check-apps.ts';
+import { createApp, type CreateAppOptions } from '../scripts/create-app.ts';
+import { appRequestUrl } from '../src/server/app-requests.ts';
+import { createSkillLibrary } from '../src/providers/pi/skills.ts';
+import {
+  appDefinitionSchema,
+  appContractSchema,
+  appContractSchemaId,
+  type AppContractInput,
+} from '../src/shared/app-definitions.ts';
+import { appSchemaFiles } from '../scripts/app-schemas.ts';
+import { Compile } from 'typebox/compile';
+
+test('app folders reject escaped paths, incomplete contracts, and unsupported server definitions', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-app-profile-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = fileURLToPath(new URL('../src/apps/linear', import.meta.url));
+  async function fixture(name: string) {
+    const directory = join(root, name);
+    await mkdir(directory);
+    await cp(source, join(directory, 'linear'), { recursive: true });
+    return directory;
+  }
+  async function change(directory: string, file: string, update: (value: any) => void) {
+    const path = join(directory, 'linear', file);
+    const value = JSON.parse(await readFile(path, 'utf8'));
+    update(value);
+    await writeFile(path, JSON.stringify(value));
+  }
+  const valid = await fixture('valid');
+  await writeFile(join(valid, '.DS_Store'), 'synthetic system metadata');
+  await checkAppContract(loadAppCatalog(valid).get('linear')!);
+  const arrayApp = loadAppCatalog(valid).get('linear')!;
+  assert(arrayApp.kind === 'mcp');
+  await checkAppContract({
+    ...arrayApp,
+    contract: { ...arrayApp.contract, output: [{ id: 'synthetic-array-record' }] },
+  });
+  const invalidJson = await fixture('invalid-json');
+  await writeFile(join(invalidJson, 'linear/plugin.json'), 'synthetic-private-value: {');
+  assert.throws(
+    () => loadAppCatalog(invalidJson),
+    (error: Error) => {
+      assert.match(error.message, /invalid JSON/);
+      assert(!error.message.includes('synthetic-private-value'));
+      return true;
+    },
+  );
+  const missing = await fixture('missing');
+  await rm(join(missing, 'linear/io.n8n.nod/contract.json'));
+  assert.throws(() => loadAppCatalog(missing), /contract.json/);
+  const escaped = await fixture('escaped');
+  await rm(join(escaped, 'linear/io.n8n.nod/icon.svg'));
+  await symlink(
+    join(valid, 'linear/io.n8n.nod/icon.svg'),
+    join(escaped, 'linear/io.n8n.nod/icon.svg'),
+  );
+  assert.throws(() => loadAppCatalog(escaped), /leaves the app directory/);
+  const linked = join(root, 'linked');
+  await mkdir(linked);
+  await symlink(join(valid, 'linear'), join(linked, 'linear'));
+  assert.throws(() => loadAppCatalog(linked), /without symbolic links/);
+  const cases: Array<[string, string, (value: any) => void, RegExp]> = [
+    [
+      'version',
+      'mcp.json',
+      (value) => {
+        value.$schema = 'https://agent-plugins.org/schemas/9.0.0/mcp.schema.json';
+      },
+      /Agent Plugins 1.0.0/,
+    ],
+    [
+      'secret',
+      'mcp.json',
+      (value) => {
+        value.mcpServers.linear.headers = { Authorization: 'synthetic-never-display-this' };
+      },
+      /headers are not supported/,
+    ],
+    [
+      'private',
+      'mcp.json',
+      (value) => {
+        value.mcpServers.linear.url = 'https://127.0.0.1/mcp';
+      },
+      /public HTTPS/,
+    ],
+    [
+      'port',
+      'mcp.json',
+      (value) => {
+        value.mcpServers.linear.url = 'https://mcp.linear.app:8443/mcp';
+      },
+      /public HTTPS/,
+    ],
+    ...['?', '#'].map((delimiter, index): [string, string, (value: any) => void, RegExp] => [
+      `empty-url-delimiter-${index}`,
+      'mcp.json',
+      (value) => {
+        value.mcpServers.linear.url += delimiter;
+      },
+      /public HTTPS/,
+    ]),
+    [
+      'stdio',
+      'mcp.json',
+      (value) => {
+        value.mcpServers.linear = { type: 'stdio', command: 'node' };
+      },
+      /streamable-http/,
+    ],
+    [
+      'server',
+      'io.n8n.nod/app.json',
+      (value) => {
+        value.connection.server = 'missing';
+      },
+      /selected server/,
+    ],
+    [
+      'placeholder',
+      'io.n8n.nod/contract.json',
+      (value) => {
+        value.tool.name = 'replace_with_read_tool';
+      },
+      /invalid contract/,
+    ],
+  ];
+  for (const [name, file, update, reason] of cases) {
+    const directory = await fixture(name);
+    await change(directory, file, update);
+    assert.throws(
+      () => loadAppCatalog(directory),
+      (error: Error) => {
+        assert.match(error.message, reason);
+        assert(!error.message.includes('synthetic-never-display-this'));
+        return true;
+      },
+    );
+  }
+  const invalidInput = await fixture('input');
+  await change(invalidInput, 'io.n8n.nod/contract.json', (value) => {
+    value.input = { query: 42 };
+  });
+  await assert.rejects(
+    checkAppContract(loadAppCatalog(invalidInput).get('linear')!),
+    /does not match/,
+  );
+  const patternInput = await fixture('pattern-input');
+  await change(patternInput, 'io.n8n.nod/contract.json', (value) => {
+    value.tool.inputSchema.properties.query.pattern = '^allowed_';
+  });
+  await assert.rejects(
+    checkAppContract(loadAppCatalog(patternInput).get('linear')!),
+    /does not match/,
+  );
+  await change(patternInput, 'io.n8n.nod/contract.json', (value) => {
+    value.input.query = 'allowed_synthetic_query';
+  });
+  await checkAppContract(loadAppCatalog(patternInput).get('linear')!);
+  await change(patternInput, 'io.n8n.nod/contract.json', (value) => {
+    value.tool.inputSchema.required = 'query';
+  });
+  await assert.rejects(
+    checkAppContract(loadAppCatalog(patternInput).get('linear')!),
+    /not valid JSON Schema 2020-12/,
+  );
+});
+
+test('app scaffolding refuses replacement and requires contributors to complete the read contract', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-app-scaffold-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = {
+    directory,
+    url: 'https://mcp.linear.app/mcp',
+    name: 'Synthetic app',
+    auth: 'oauth2' as const,
+  };
+  for (const slug of ['../escape', 'trailing-', 'double--hyphen', 'a'])
+    await assert.rejects(createApp(slug, options));
+  for (const url of [
+    'https://127.0.0.1/mcp',
+    'https://[::1]/mcp',
+    'https://localhost/mcp',
+    'https://mcp.example.com/mcp',
+    'https://mcp.internal/mcp',
+    'https://mcp.test/mcp',
+    'https://mcp.linear.app:8443/mcp',
+    `${options.url}?`,
+    `${options.url}#`,
+  ])
+    await assert.rejects(createApp('synthetic-app', { ...options, url }), /public HTTPS/);
+  for (const name of ['', '   ', 'n'.repeat(81)])
+    await assert.rejects(createApp('synthetic-app', { ...options, name }), /app name/);
+  assert.deepEqual(await readdir(directory), []);
+  await createApp('synthetic-app', options);
+  await assert.rejects(createApp('synthetic-app', options), { code: 'EEXIST' });
+  assert.throws(() => loadAppCatalog(directory), /invalid contract/);
+  const manifestPath = join(directory, 'synthetic-app/plugin.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.author.name = 'Synthetic maintainer';
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const appPath = join(directory, 'synthetic-app/io.n8n.nod/app.json');
+  const app = JSON.parse(await readFile(appPath, 'utf8'));
+  app.requirements = ['A disposable account with read access.'];
+  app.limitations = ['Automatic monitoring is not supported.'];
+  await writeFile(appPath, JSON.stringify(app));
+  await writeFile(
+    join(directory, 'synthetic-app/io.n8n.nod/contract.json'),
+    JSON.stringify(bundledApps.get('linear')!.contract),
+  );
+  await checkAppContract(loadAppCatalog(directory).get('synthetic-app')!);
+});
+
+const communityAccessCases: Array<{
+  slug: string;
+  options: CreateAppOptions;
+  contract: AppContractInput;
+}> = [
+  {
+    slug: 'sample-api',
+    options: { type: 'http', url: 'https://api.synthetic-nod.dev/v1', auth: 'bearer' },
+    contract: {
+      $schema: appContractSchemaId,
+      type: 'http',
+      source: 'https://docs.synthetic-nod.dev/api',
+      request: { method: 'GET', path: 'account' },
+      annotations: { readOnlyHint: true },
+      output: { id: 'synthetic-account' },
+    },
+  },
+  {
+    slug: 'sample-api-key',
+    options: { type: 'http', url: 'https://api.synthetic-nod.dev/v1', auth: 'x-api-key' },
+    contract: {
+      $schema: appContractSchemaId,
+      type: 'http',
+      source: 'https://docs.synthetic-nod.dev/api',
+      request: { method: 'GET', path: 'account' },
+      annotations: { readOnlyHint: true },
+      output: [{ id: 'synthetic-account' }],
+    },
+  },
+  {
+    slug: 'sample-graphql',
+    options: { type: 'http', url: 'https://api.synthetic-nod.dev', auth: 'bearer' },
+    contract: {
+      $schema: appContractSchemaId,
+      type: 'http',
+      source: 'https://docs.synthetic-nod.dev/graphql',
+      request: { method: 'POST', path: 'graphql', body: { query: 'query { viewer { id } }' } },
+      annotations: { readOnlyHint: true },
+      output: { data: { viewer: { id: 'synthetic-account' } } },
+    },
+  },
+  {
+    slug: 'sample-cli',
+    options: {
+      type: 'cli',
+      command: 'samplecli',
+      source: { npm: '@synthetic/cli@1.2.3' },
+      auth: 'env',
+      environment: { SAMPLE_TOKEN: 'Access token', SAMPLE_ACCOUNT_ID: 'Account ID' },
+    },
+    contract: {
+      $schema: appContractSchemaId,
+      type: 'cli',
+      source: 'https://docs.synthetic-nod.dev/cli',
+      argv: ['account', 'view', '--json', 'two words; $(not-a-command)'],
+      format: 'json',
+      timeoutSeconds: 30,
+      annotations: { readOnlyHint: true },
+      output: { id: 'synthetic-account' },
+    },
+  },
+  {
+    slug: 'sample-text-cli',
+    options: {
+      type: 'cli',
+      command: 'samplecli',
+      source: { pypi: 'synthetic-cli==1.2.3' },
+      auth: 'env',
+      environment: { SAMPLE_TOKEN: 'Access token' },
+    },
+    contract: {
+      $schema: appContractSchemaId,
+      type: 'cli',
+      source: 'https://docs.synthetic-nod.dev/cli',
+      argv: ['account', 'view'],
+      format: 'text',
+      timeoutSeconds: 30,
+      annotations: { readOnlyHint: true },
+      output: 'Synthetic account',
+    },
+  },
+];
+
+async function completedCommunityApp(
+  directory: string,
+  fixture: (typeof communityAccessCases)[number],
+) {
+  await createApp(fixture.slug, {
+    ...fixture.options,
+    name: fixture.slug === 'sample-api' ? 'Équipe +' : 'Sample app',
+    directory,
+  });
+  const base = join(directory, fixture.slug);
+  const manifest = JSON.parse(await readFile(join(base, 'plugin.json'), 'utf8'));
+  manifest.author.name = 'Synthetic maintainer';
+  await writeFile(join(base, 'plugin.json'), JSON.stringify(manifest));
+  const definition = JSON.parse(await readFile(join(base, 'io.n8n.nod/app.json'), 'utf8'));
+  definition.requirements = ['An account with read access.'];
+  definition.limitations = ['No automatic background checks.'];
+  if (fixture.slug === 'sample-api-key') definition.connection.apiKeyHeader = 'X-Access-Key';
+  await writeFile(join(base, 'io.n8n.nod/app.json'), JSON.stringify(definition));
+  await writeFile(join(base, 'io.n8n.nod/contract.json'), JSON.stringify(fixture.contract));
+  return loadAppCatalog(directory).get(fixture.slug)!;
+}
+
+test('API and CLI app scaffolds pass real transport and process contracts and reject unsafe definitions', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () =>
+    assert.fail('Community contracts must stay offline.'),
+  );
+  const directory = await mkdtemp(join(tmpdir(), 'nod-community-contracts-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const editor = Compile(appSchemaFiles['app.schema.json'] as Parameters<typeof Compile>[0]);
+  const editorContract = Compile(
+    appSchemaFiles['contract.schema.json'] as Parameters<typeof Compile>[0],
+  );
+  for (const fixture of communityAccessCases) {
+    const app = await completedCommunityApp(directory, fixture);
+    await checkAppContract(app);
+    const path = join(directory, fixture.slug, 'io.n8n.nod/app.json');
+    const definition: Record<string, any> = JSON.parse(await readFile(path, 'utf8'));
+    assert(editor.Check(definition));
+    assert(editorContract.Check(fixture.contract));
+    assert(appContractSchema.safeParse(fixture.contract).success);
+    for (const connection of fixture.options.type === 'cli'
+      ? [
+          { ...definition.connection, source: { npm: '@synthetic/cli@latest' } },
+          { ...definition.connection, source: { npm: '@synthetic/cli@1.2.3 --force' } },
+          { ...definition.connection, source: { url: 'https://downloads.synthetic-nod.dev/cli' } },
+          { ...definition.connection, command: 'bash' },
+          { ...definition.connection, command: 'BaSh' },
+          { ...definition.connection, command: 'PyThOn3' },
+          { ...definition.connection, environment: {} },
+          { ...definition.connection, environment: { LD_PRELOAD: 'Library' } },
+          { ...definition.connection, authentication: ['bearer'] },
+        ]
+      : [
+          { ...definition.connection, authentication: ['env'] },
+          { ...definition.connection, authentication: ['oauth2', 'bearer'] },
+          { ...definition.connection, apiKeyHeader: 'Host' },
+          { ...definition.connection, headers: { Authorization: 'synthetic-token' } },
+        ]) {
+      const invalid = { ...definition, connection };
+      assert.equal(appDefinitionSchema.safeParse(invalid).success, false);
+      assert.equal(editor.Check(invalid), false);
+    }
+    const saved = JSON.stringify(definition);
+    for (const connection of fixture.options.type === 'cli'
+      ? [
+          {
+            ...definition.connection,
+            source: { url: 'https://127.0.0.1/cli', sha256: 'a'.repeat(64) },
+          },
+        ]
+      : [
+          { ...definition.connection, url: 'https://127.0.0.1/api' },
+          { ...definition.connection, url: 'https://api.synthetic-nod.dev/v1?token=synthetic' },
+          { ...definition.connection, url: 'https://api.synthetic-nod.dev:8443/v1' },
+        ]) {
+      await writeFile(path, JSON.stringify({ ...definition, connection }));
+      assert.throws(() => loadAppCatalog(directory), /public HTTPS/);
+    }
+    await writeFile(path, saved);
+    const contractPath = join(directory, fixture.slug, 'io.n8n.nod/contract.json');
+    await writeFile(contractPath, JSON.stringify(bundledApps.get('linear')!.contract));
+    assert.throws(() => loadAppCatalog(directory), /connection type/);
+    await writeFile(contractPath, JSON.stringify(fixture.contract));
+  }
+});
+
+test('app access paths reject inconsistent API reads and more than 16 CLI fields', () => {
+  const path = { kind: 'http', endpoint: 'https://api.synthetic-nod.dev/v1', testPath: 'account' };
+  assert(appAccessSchema.safeParse(path).success);
+  for (const extra of [
+    { testMethod: 'GET', testBody: { query: 'synthetic' } },
+    { testMethod: 'POST' },
+    { apiKeyHeader: 'X-Access-Key' },
+    { clientIdRequired: true },
+  ])
+    assert.equal(appAccessSchema.safeParse({ ...path, ...extra }).success, false);
+  assert.equal(
+    appAccessSchema.safeParse({
+      kind: 'cli',
+      command: 'synthetic',
+      source: { npm: 'synthetic' },
+      env: Array.from({ length: 17 }, (_, i) => `FIXTURE_${i}_TOKEN`),
+    }).success,
+    false,
+  );
+  assert.throws(() => appRequestUrl(path.endpoint, 'account#private'), /path/);
+});
+
+test(
+  'API and CLI app folders use common setup, verify access, preserve account bindings and remove credentials',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    for (const fixture of communityAccessCases)
+      await t.test(fixture.slug, async (t) => {
+        const diagnostics: unknown[] = [];
+        await withFailureLog(
+          (event, error, context) => diagnostics.push({ event, error, context }),
+          async () => {
+            const directory = await mkdtemp(join(tmpdir(), 'nod-community-lifecycle-'));
+            t.after(() => rm(directory, { recursive: true, force: true }));
+            const definition = await completedCommunityApp(directory, fixture);
+            const apps = loadAppCatalog(directory);
+            const database = await hostedDatabase();
+            const server = Fastify();
+            t.after(async () => {
+              await server.close();
+              await database.close();
+            });
+            const ownerId = 'synthetic-owner';
+            const values =
+              definition.kind === 'cli'
+                ? Object.fromEntries(
+                    Object.keys(definition.environment).map((name) => [
+                      name,
+                      name.endsWith('_ID')
+                        ? '42'
+                        : name.endsWith('_EMAIL')
+                          ? 'synthetic@example.test'
+                          : 'synthetic-private-cli-token',
+                    ]),
+                  )
+                : { token: 'synthetic-private-api-token' };
+            const secrets = Object.values(values);
+            let failure: 'permission' | 'rate' | 'invalid-json' | undefined;
+            let calls = 0;
+            const transport = createDiscoveredTransport(
+              async (input, init) => {
+                assert(definition.kind === 'http');
+                const request = new Request(input, init);
+                const read = definition.contract.request;
+                assert.equal(request.url, appRequestUrl(definition.endpoint, read.path));
+                assert.equal(request.method, read.method);
+                assert.equal(
+                  request.headers.get(
+                    definition.auth === 'x-api-key' ? 'X-Access-Key' : 'Authorization',
+                  ),
+                  definition.auth === 'x-api-key' ? values.token : `Bearer ${values.token}`,
+                );
+                assert.equal(
+                  await request.text(),
+                  read.method === 'POST' ? JSON.stringify(read.body) : '',
+                );
+                calls++;
+                if (failure)
+                  return Response.json(
+                    { error: `synthetic_${failure} ${secrets.join(' ')}` },
+                    { status: failure === 'rate' ? 429 : 403 },
+                  );
+                return Response.json({ data: definition.contract.output, secrets });
+              },
+              async (endpoint) => {
+                assert.equal(endpoint, definition.endpoint);
+                return endpoint;
+              },
+            );
+            const cli = async (
+              command: import('../src/ports/computer.ts').ConnectedCli,
+              argv: string[],
+              environment: Record<string, string>,
+              timeout?: number,
+            ) => {
+              assert(definition.kind === 'cli');
+              assert.equal(command.command, definition.command);
+              assert.deepEqual(command.source, definition.source);
+              assert.deepEqual(argv, definition.contract.argv);
+              assert.deepEqual(environment, values);
+              assert.equal(timeout, definition.contract.timeoutSeconds);
+              calls++;
+              const output =
+                definition.contract.format === 'json'
+                  ? JSON.stringify({ data: definition.contract.output, secrets })
+                  : `Synthetic account ${secrets.join(' ')}`;
+              return {
+                exitCode: failure === 'permission' || failure === 'rate' ? 7 : 0,
+                output: failure ? `synthetic_${failure} ${secrets.join(' ')}` : output,
+                stdout: failure ? `synthetic_${failure} ${secrets.join(' ')}` : output,
+                stderr: 'Synthetic warning on stderr.',
+              };
+            };
+            const grantVault = await createAppGrantVault(database.pool, {
+              ownerId,
+              keyStore: installationKeyStore,
+            });
+            const options = {
+              apps,
+              ownerId,
+              baseUrl: 'http://localhost:4310',
+              grantVault,
+              transport,
+              oauth: {
+                begin: async () => assert.fail('Token apps do not start OAuth.'),
+                finish: async () => assert.fail('Token apps do not finish OAuth.'),
+                refresh: async () => assert.fail('Token apps do not refresh OAuth.'),
+              },
+              runCli: async (
+                _thread: string,
+                command: import('../src/ports/computer.ts').ConnectedCli,
+                argv: string[],
+                environment: Record<string, string>,
+                timeout?: number,
+              ) => cli(command, argv, environment, timeout),
+              verifyCli: cli,
+            };
+            const discovered = await createDiscoveredConnections(database.pool, options);
+            const reviewed = appAccessSchema.parse(appAccessPath(definition));
+            await assert.rejects(
+              discovered.propose({
+                service: definition.slug,
+                name: definition.name,
+                paths: [
+                  reviewed.kind === 'cli'
+                    ? { ...reviewed, source: { npm: '@synthetic/cli' } }
+                    : { ...reviewed, endpoint: 'https://other.synthetic-nod.dev/api' },
+                ],
+              }),
+              /reviewed connection/,
+            );
+            assert.equal(calls, 0);
+            const provider = fakeProvider({
+              id: 'unused',
+              authorize: async () => assert.fail('Use app setup.'),
+              search: async () => ({ tools: {}, suggestions: [] }),
+              execute: async () => assert.fail('Use the app access path.'),
+            });
+            provider.configured = false;
+            const integrations = await createIntegrations(database.pool, {
+              ownerId,
+              provider,
+              discovered,
+              baseUrl: 'http://localhost:4310',
+              wake: async () => {},
+            });
+            integrations.registerRoutes(server);
+            const catalog = (await server.inject('/api/apps/catalog')).json<AppConnection[]>();
+            assert(
+              catalog.some((app) => app.slug === definition.slug && app.name === definition.name),
+            );
+            const start = await server.inject({
+              method: 'POST',
+              url: `/api/apps/${definition.slug}/connect`,
+            });
+            assert.equal(start.statusCode, 200, start.body);
+            const id = new URL(start.json().url, 'http://localhost:4310').searchParams.get(
+              'connect',
+            )!;
+            const setup = await server.inject(`/api/apps/discovery/${id}`);
+            assert.equal(setup.statusCode, 200, setup.body);
+            assert.equal(setup.json().catalogApp, true);
+            if (definition.kind === 'cli')
+              assert.deepEqual(setup.json().credentialLabels, definition.environment);
+            const complete = (proposalId = id) =>
+              server.inject({
+                method: 'POST',
+                url: `/api/apps/discovery/${proposalId}/complete`,
+                payload: {
+                  token: definition.kind === 'cli' ? values : values.token,
+                  accountName: 'Synthetic account',
+                },
+              });
+            failure = 'permission';
+            const denied = await complete();
+            assert.equal(denied.statusCode, 409, denied.body);
+            assert.match(denied.body, /synthetic_permission/);
+            assert(diagnostics.length);
+            for (const secret of secrets) {
+              assert(!denied.body.includes(secret));
+              assert(!JSON.stringify(diagnostics).includes(secret));
+            }
+            assert.equal(
+              (await database.pool.query('SELECT id FROM discovered_connections')).rowCount,
+              0,
+            );
+            if (definition.kind === 'cli' && definition.contract.format === 'json') {
+              failure = 'invalid-json';
+              const invalid = await complete();
+              assert.equal(invalid.statusCode, 409, invalid.body);
+              assert.match(invalid.body, /valid JSON/);
+            }
+            failure = undefined;
+            const connected = await complete();
+            assert.equal(connected.statusCode, 200, connected.body);
+            const saved = (await discovered.list()).find((app) => app.slug === definition.slug)!;
+            assert(saved?.connectionId);
+            const account = (await discovered.search(definition.name, saved.connectionId))
+              .accounts[0];
+            const pathId = account.paths[0].id;
+            const args =
+              definition.kind === 'http'
+                ? {
+                    connectionId: saved.connectionId,
+                    pathId,
+                    method: definition.contract.request.method,
+                    path: definition.contract.request.path,
+                    ...(definition.contract.request.method === 'POST'
+                      ? { body: definition.contract.request.body }
+                      : {}),
+                  }
+                : definition.kind === 'cli'
+                  ? {
+                      connectionId: saved.connectionId,
+                      pathId,
+                      argv: definition.contract.argv,
+                      timeoutSeconds: definition.contract.timeoutSeconds,
+                    }
+                  : assert.fail('Use an API or CLI fixture.');
+            const action = definition.kind === 'http' ? 'CONNECTED_HTTP' : 'CONNECTED_CLI';
+            const ref = { threadId: randomUUID(), turnId: randomUUID() };
+            const output = await discovered.execute(action, args, ref);
+            for (const secret of secrets) assert(!JSON.stringify(output).includes(secret));
+            const before = calls;
+            await assert.rejects(
+              discovered.execute(action, args, ref, undefined, 'stale-binding'),
+              /changed/,
+            );
+            await assert.rejects(
+              discovered.execute(action, { ...args, pathId: randomUUID() }, ref),
+              /unavailable/,
+            );
+            const stopped = new AbortController();
+            stopped.abort(new Error('synthetic_stop'));
+            await assert.rejects(
+              discovered.execute(action, args, ref, stopped.signal),
+              /synthetic_stop/,
+            );
+            const foreign = await createDiscoveredConnections(database.pool, {
+              ...options,
+              ownerId: 'synthetic-other-owner',
+            });
+            await assert.rejects(foreign.execute(action, args, ref), /unavailable/);
+            assert.equal(calls, before);
+            failure = 'rate';
+            if (definition.kind === 'http')
+              await assert.rejects(discovered.execute(action, args, ref), (error: Error) => {
+                assert.match(error.message, /429.*synthetic_rate/);
+                for (const secret of secrets) assert(!error.message.includes(secret));
+                return true;
+              });
+            else
+              assert.equal(
+                ((await discovered.execute(action, args, ref)) as { exitCode: number }).exitCode,
+                7,
+              );
+            assert.equal(calls, before + 1);
+            failure = undefined;
+            const reconnect = await discovered.reconnect(definition.slug, saved.connectionId);
+            const nextId = new URL(reconnect.url, 'http://localhost:4310').searchParams.get(
+              'connect',
+            )!;
+            const next = await server.inject(`/api/apps/discovery/${nextId}`);
+            assert.deepEqual(next.json().paths, setup.json().paths);
+            assert.equal((await complete(nextId)).statusCode, 200);
+            const current = (await discovered.list()).find((app) => app.slug === definition.slug)!;
+            assert(current?.connectionId);
+            const currentPath = (await discovered.search(definition.name, current.connectionId))
+              .accounts[0].paths[0].id;
+            await discovered.disconnect(current.connectionId, definition.slug);
+            const afterDisconnect = calls;
+            await assert.rejects(
+              discovered.execute(
+                action,
+                { ...args, connectionId: current.connectionId, pathId: currentPath },
+                ref,
+              ),
+              /unavailable/,
+            );
+            assert.equal(calls, afterDisconnect);
+          },
+        );
+      });
+  },
+);
+
+test(
+  'API apps use standard OAuth with PKCE, registration or an owner client ID, refresh and issuer checks',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    for (const registered of [false, true])
+      await t.test(registered ? 'owner client ID' : 'dynamic registration', async (t) => {
+        const directory = await mkdtemp(join(tmpdir(), 'nod-community-oauth-'));
+        t.after(() => rm(directory, { recursive: true, force: true }));
+        const fixture = {
+          ...communityAccessCases[0],
+          slug: 'sample-oauth',
+          options: {
+            type: 'http' as const,
+            url: 'https://api.synthetic-nod.dev/v1',
+            auth: 'oauth2' as const,
+          },
+        };
+        await completedCommunityApp(directory, fixture);
+        const path = join(directory, fixture.slug, 'io.n8n.nod/app.json');
+        const config = JSON.parse(await readFile(path, 'utf8'));
+        config.connection.scopes = ['records:read'];
+        config.connection.oauth = {
+          issuer: 'https://auth.synthetic-nod.dev',
+          authorization_endpoint: 'https://auth.synthetic-nod.dev/authorize',
+          token_endpoint: 'https://auth.synthetic-nod.dev/token',
+          ...(registered
+            ? {}
+            : { registration_endpoint: 'https://auth.synthetic-nod.dev/register' }),
+          authorization_response_iss_parameter_supported: true,
+        };
+        if (registered) config.connection.clientIdRequired = true;
+        await writeFile(path, JSON.stringify(config));
+        const apps = loadAppCatalog(directory);
+        const definition = apps.get(fixture.slug)!;
+        assert(definition.kind === 'http' && definition.auth === 'oauth');
+        const database = await hostedDatabase();
+        const server = Fastify();
+        t.after(async () => {
+          await server.close();
+          await database.close();
+        });
+        const ownerId = 'synthetic-owner';
+        const grantVault = await createAppGrantVault(database.pool, {
+          ownerId,
+          keyStore: installationKeyStore,
+        });
+        let registrations = 0;
+        let exchanges = 0;
+        let reads = 0;
+        let token = 'synthetic-oauth-access-token';
+        let codeChallenge = '';
+        const oauth = createDiscoveredOAuth(
+          async (input, init) => {
+            const request = new Request(input, init);
+            const url = new URL(request.url);
+            if (url.pathname.startsWith('/.well-known/'))
+              return new Response(null, { status: 404 });
+            assert.equal(url.origin, 'https://auth.synthetic-nod.dev');
+            if (url.pathname === '/register') {
+              assert.equal(registered, false);
+              registrations++;
+              const body = JSON.parse(await request.text());
+              assert.equal(body.token_endpoint_auth_method, 'none');
+              return Response.json(
+                { client_id: 'synthetic-dynamic-client', ...body },
+                { status: 201 },
+              );
+            }
+            assert.equal(url.pathname, '/token');
+            const body = new URLSearchParams(await request.text());
+            assert.equal(
+              body.get('client_id'),
+              registered ? 'synthetic-owner-client' : 'synthetic-dynamic-client',
+            );
+            if (body.get('grant_type') === 'authorization_code') {
+              assert.equal(body.get('code'), 'synthetic-authorization-code');
+              assert.equal(
+                createHash('sha256').update(body.get('code_verifier')!).digest('base64url'),
+                codeChallenge,
+              );
+            } else {
+              assert.equal(body.get('grant_type'), 'refresh_token');
+              assert.equal(body.get('refresh_token'), 'synthetic-oauth-refresh-token');
+              token = 'synthetic-refreshed-oauth-access-token';
+            }
+            exchanges++;
+            return Response.json({
+              access_token: token,
+              refresh_token: 'synthetic-oauth-refresh-token',
+              token_type: 'Bearer',
+              expires_in: 3600,
+            });
+          },
+          async (url) => {
+            assert.equal(new URL(url).origin, 'https://auth.synthetic-nod.dev');
+            return url;
+          },
+        );
+        const discovered = await createDiscoveredConnections(database.pool, {
+          apps,
+          ownerId,
+          baseUrl: 'http://localhost:4310',
+          grantVault,
+          oauth,
+          transport: createDiscoveredTransport(
+            async (input, init) => {
+              const request = new Request(input, init);
+              assert.equal(request.url, 'https://api.synthetic-nod.dev/v1/account');
+              assert.equal(request.method, 'GET');
+              assert.equal(request.headers.get('authorization'), `Bearer ${token}`);
+              reads++;
+              return Response.json({ id: 'synthetic-account', token });
+            },
+            async (value) => value,
+          ),
+        });
+        const provider = fakeProvider({
+          id: 'unused',
+          authorize: async () => assert.fail('Use app OAuth.'),
+          search: async () => ({ tools: {}, suggestions: [] }),
+          execute: async () => assert.fail('Use the API app.'),
+        });
+        provider.configured = false;
+        const integrations = await createIntegrations(database.pool, {
+          ownerId,
+          provider,
+          discovered,
+          baseUrl: 'http://localhost:4310',
+          wake: async () => {},
+        });
+        integrations.registerRoutes(server);
+        const start = await server.inject({
+          method: 'POST',
+          url: `/api/apps/${fixture.slug}/connect`,
+        });
+        assert.equal(start.statusCode, 200, start.body);
+        let link = start.json().url;
+        if (registered) {
+          assert(link.startsWith('/apps?connect='));
+          const id = new URL(link, 'http://localhost').searchParams.get('connect');
+          const setup = await server.inject(`/api/apps/discovery/${id}`);
+          assert.equal(setup.json().callbackUrl, 'http://127.0.0.1:4310/api/apps/callback');
+          const authorize = await server.inject({
+            method: 'POST',
+            url: `/api/apps/discovery/${id}/authorize`,
+            payload: { clientId: 'synthetic-owner-client' },
+          });
+          assert.equal(authorize.statusCode, 200, authorize.body);
+          link = authorize.json().url;
+        }
+        const signIn = new URL(link);
+        assert.equal(signIn.origin, 'https://auth.synthetic-nod.dev');
+        assert.equal(signIn.searchParams.get('code_challenge_method'), 'S256');
+        assert.equal(signIn.searchParams.get('scope'), 'records:read');
+        codeChallenge = signIn.searchParams.get('code_challenge')!;
+        assert(codeChallenge);
+        const callback = await server.inject(
+          `/api/apps/callback?${new URLSearchParams({ state: signIn.searchParams.get('state')!, code: 'synthetic-authorization-code', iss: 'https://auth.synthetic-nod.dev' })}`,
+        );
+        assert.equal(
+          new URL(callback.headers.location!).searchParams.get('connection'),
+          'connected',
+        );
+        assert.equal(registrations, registered ? 0 : 1);
+        assert.equal(reads, 1);
+        const saved = (await discovered.list()).find((app) => app.slug === fixture.slug)!;
+        assert(saved?.connectionId);
+        const grant = await grantVault.read(saved.connectionId);
+        const state = JSON.parse(grant.value);
+        state.expiresAt = Date.now() - 120_000;
+        await grantVault.replace(saved.connectionId, grant.version, JSON.stringify(state));
+        const access = (await discovered.search(definition.name, saved.connectionId)).accounts[0]
+          .paths[0];
+        const result = await discovered.execute('CONNECTED_HTTP', {
+          connectionId: saved.connectionId,
+          pathId: access.id,
+          method: 'GET',
+          path: 'account',
+        });
+        assert(!JSON.stringify(result).includes(token));
+        assert.equal(exchanges, 2);
+        assert.equal(reads, 2);
+        const reconnect = await discovered.reconnect(fixture.slug, saved.connectionId);
+        const id = new URL(reconnect.url, 'http://localhost').searchParams.get('connect');
+        const retry = await server.inject({
+          method: 'POST',
+          url: `/api/apps/discovery/${id}/authorize`,
+          payload: registered ? { clientId: 'synthetic-owner-client' } : {},
+        });
+        assert.equal(retry.statusCode, 200, retry.body);
+        const retryLink = new URL(retry.json().url);
+        const before = exchanges;
+        const refused = await discovered.completeOAuth({
+          state: retryLink.searchParams.get('state')!,
+          code: 'synthetic-authorization-code',
+          iss: 'https://wrong-issuer.synthetic-nod.dev',
+        });
+        assert.equal(refused?.outcome, 'failed');
+        assert.equal(exchanges, before);
+        await discovered.disconnect(saved.connectionId, fixture.slug);
+      });
+  },
+);
+
+test('app skills cannot shadow core guides or load without a trusted root', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-app-skills-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  assert.throws(() => createSkillLibrary([]), /At least one skill directory/);
+  const builtin = join(directory, 'builtin');
+  const apps = join(directory, 'apps');
+  await mkdir(join(builtin, 'artifacts'), { recursive: true });
+  await mkdir(join(apps, 'artifacts'), { recursive: true });
+  await writeFile(join(builtin, 'artifacts/SKILL.md'), 'Synthetic core guide.');
+  await writeFile(
+    join(apps, 'artifacts/SKILL.md'),
+    '---\nname: artifacts\ndescription: A synthetic app guide.\n---\nApp content.',
+  );
+  assert.throws(() => createSkillLibrary([builtin, apps], ['artifacts']), /conflicts with a core/);
+  await rm(join(apps, 'artifacts'), { recursive: true });
+  await mkdir(join(apps, 'community-guide'));
+  const body = '---\nname: community-guide\ndescription: A synthetic app guide.\n---\nApp content.';
+  await writeFile(join(apps, 'community-guide/SKILL.md'), body);
+  const library = createSkillLibrary([builtin, apps], ['artifacts']);
+  assert.equal(library.read('artifacts').content, 'Synthetic core guide.');
+  assert.equal(library.read('community-guide').content, body);
+  await mkdir(join(builtin, 'community-guide'));
+  await writeFile(join(builtin, 'community-guide/SKILL.md'), body);
+  assert.throws(() => createSkillLibrary([builtin, apps], ['artifacts']), /metadata is invalid/);
+});
+
+test('published app schemas reject unsupported definitions with the runtime validators', async () => {
+  const editorApp = Compile(appSchemaFiles['app.schema.json'] as Parameters<typeof Compile>[0]);
+  const editorContract = Compile(
+    appSchemaFiles['contract.schema.json'] as Parameters<typeof Compile>[0],
+  );
+  const app = JSON.parse(
+    await readFile(new URL('../src/apps/linear/io.n8n.nod/app.json', import.meta.url), 'utf8'),
+  );
+  const instance = JSON.parse(
+    await readFile(new URL('../src/apps/n8n/io.n8n.nod/app.json', import.meta.url), 'utf8'),
+  );
+  assert(editorApp.Check(app));
+  assert(editorApp.Check(instance));
+  for (const change of [
+    (value: any) => {
+      value.displayName = 42;
+    },
+    (value: any) => {
+      value.displayName = '   ';
+    },
+    (value: any) => {
+      value.displayName = ' Leading space';
+    },
+    (value: any) => {
+      value.requirements = ['   '];
+    },
+    (value: any) => {
+      value.unknownSetting = true;
+    },
+    (value: any) => {
+      value.$schema = value.$schema.replace('/v1/', '/v2/');
+    },
+    (value: any) => {
+      value.prompts = 'Read my records.';
+    },
+    (value: any) => {
+      value.connection.authentication = ['password'];
+    },
+    (value: any) => {
+      value.connection.authentication = ['bearer'];
+    },
+    (value: any) => {
+      value.connection.authentication = ['oauth2', 'bearer'];
+    },
+    (value: any) => {
+      value.connection.endpoint = { source: 'owner', path: '/mcp' };
+    },
+    (value: any) => {
+      value.connection.headers = { Authorization: 'synthetic-private-token' };
+    },
+  ]) {
+    const invalid: unknown = structuredClone(app);
+    change(invalid);
+    assert.equal(appDefinitionSchema.safeParse(invalid).success, false);
+    assert.equal(editorApp.Check(invalid), false);
+  }
+  const contract = structuredClone(bundledApps.get('linear')!.contract);
+  assert(editorContract.Check(contract));
+  for (const change of [
+    (value: any) => {
+      value.extraSetting = true;
+    },
+    (value: any) => {
+      value.source = 'http://provider.invalid/docs';
+    },
+    (value: any) => {
+      value.tool.annotations.readOnlyHint = false;
+    },
+    (value: any) => {
+      value.tool.inputSchema.type = 'array';
+    },
+    (value: any) => {
+      value.tool.name = 'replace_with_read_tool';
+    },
+  ]) {
+    const invalid: unknown = structuredClone(contract);
+    change(invalid);
+    assert.equal(appContractSchema.safeParse(invalid).success, false);
+    assert.equal(editorContract.Check(invalid), false);
+  }
+});
+
+test('every shipped app passes the required offline connection contract suite', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () =>
+    assert.fail('App contract checks must not make external requests.'),
+  );
+  for (const app of bundledApps.values()) await t.test(app.slug, () => checkAppContract(app));
+});
+
+for (const authentication of ['oauth2', 'bearer', 'x-api-key'] as const)
+  test(
+    `an added app folder uses private setup, account binding, and credential removal with ${authentication}`,
+    { skip: !process.env.TEST_DATABASE_URL },
+    async (t) => {
+      t.mock.method(globalThis, 'fetch', async () =>
+        assert.fail('App setup must use the synthetic provider.'),
+      );
+      const directory = await mkdtemp(join(tmpdir(), 'nod-app-connection-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      await cp(
+        fileURLToPath(new URL('../src/apps/linear', import.meta.url)),
+        join(directory, 'community-fixture'),
+        { recursive: true },
+      );
+      const manifestPath = join(directory, 'community-fixture/plugin.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+      manifest.name = 'community-fixture';
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const appPath = join(directory, 'community-fixture/io.n8n.nod/app.json');
+      const app = JSON.parse(await readFile(appPath, 'utf8'));
+      app.displayName = 'Community fixture';
+      app.connection.authentication = [authentication];
+      if (authentication !== 'oauth2') delete app.connection.scopes;
+      await writeFile(appPath, JSON.stringify(app));
+      const apps = loadAppCatalog(directory);
+      const definition = apps.get('community-fixture')!;
+      assert(definition.kind === 'mcp');
+      const database = await hostedDatabase();
+      const server = Fastify();
+      t.after(async () => {
+        await server.close();
+        await database.close();
+      });
+      const token = 'synthetic-app-private-token';
+      let state = '';
+      let dispatched = 0;
+      const transport = createDiscoveredTransport(
+        async (input, init) => {
+          const request = new Request(input, init);
+          assert.equal(request.url, definition.endpoint);
+          assert.equal(
+            request.headers.get(authentication === 'x-api-key' ? 'x-api-key' : 'authorization'),
+            authentication === 'x-api-key' ? token : `Bearer ${token}`,
+          );
+          if (request.method === 'GET') return new Response(null, { status: 405 });
+          if (request.method === 'DELETE') return new Response(null, { status: 200 });
+          const message = JSON.parse(await request.text());
+          if (message.id === undefined) return new Response(null, { status: 202 });
+          if (message.method === 'tools/call') dispatched++;
+          return Response.json({
+            jsonrpc: '2.0',
+            id: message.id,
+            result:
+              message.method === 'initialize'
+                ? {
+                    protocolVersion: message.params.protocolVersion,
+                    capabilities: { tools: {} },
+                    serverInfo: { name: 'synthetic', version: '1' },
+                  }
+                : message.method === 'tools/list'
+                  ? { tools: [definition.contract.tool] }
+                  : {
+                      content: [
+                        {
+                          type: 'text',
+                          text: JSON.stringify({
+                            ...(definition.contract.output as Record<string, unknown>),
+                            privateToken: token,
+                          }),
+                        },
+                      ],
+                    },
+          });
+        },
+        async (value) => {
+          assert.equal(value, definition.endpoint);
+          return value;
+        },
+      );
+      const discovered = await createDiscoveredConnections(database.pool, {
+        apps,
+        ownerId: 'synthetic-owner',
+        baseUrl: 'http://localhost:4310',
+        transport,
+        grantVault: await createAppGrantVault(database.pool, {
+          ownerId: 'synthetic-owner',
+          keyStore: installationKeyStore,
+        }),
+        oauth: {
+          begin: async (endpoint, redirectUri, nextState, scope) => {
+            assert.equal(endpoint, definition.endpoint);
+            assert.equal(scope, 'read write');
+            state = nextState;
+            return { url: `https://consent.example.test/?state=${state}`, saved: { redirectUri } };
+          },
+          finish: async (_endpoint, saved) => ({
+            ...saved,
+            tokens: { access_token: token, token_type: 'Bearer' },
+          }),
+          refresh: async () => assert.fail('A fresh connection must not refresh.'),
+        },
+      });
+      const provider = fakeProvider({
+        id: 'unused',
+        authorize: async () => assert.fail('Use app setup.'),
+        search: async () => ({ tools: {}, suggestions: [] }),
+        execute: async () => assert.fail('Use the app transport.'),
+      });
+      provider.configured = false;
+      const integrations = await createIntegrations(database.pool, {
+        ownerId: 'synthetic-owner',
+        provider,
+        discovered,
+        baseUrl: 'http://localhost:4310',
+        wake: async () => {},
+      });
+      integrations.registerRoutes(server);
+      const catalog = (await server.inject('/api/apps/catalog')).json<AppConnection[]>();
+      assert(catalog.some((app) => app.slug === definition.slug && app.name === definition.name));
+      const listed = await integrations.list('synthetic-owner', { refresh: false });
+      assert(listed.some((app) => app.slug === definition.slug && app.direct));
+      assert.equal(
+        (await server.inject(`/api/apps/catalog/${definition.slug}/icon`)).statusCode,
+        200,
+      );
+      const start = await server.inject({
+        method: 'POST',
+        url: `/api/apps/${definition.slug}/connect`,
+      });
+      assert.equal(start.statusCode, 200, start.body);
+      assert(!start.body.includes(token));
+      if (authentication === 'oauth2') {
+        const callback = await server.inject(
+          `/api/apps/callback?state=${state}&code=synthetic-code`,
+        );
+        assert.equal(
+          new URL(callback.headers.location!).searchParams.get('connection'),
+          'connected',
+        );
+      } else {
+        assert.equal(state, '');
+        const id = new URL(start.json().url, 'http://localhost:4310').searchParams.get('connect');
+        const completed = await server.inject({
+          method: 'POST',
+          url: `/api/apps/discovery/${id}/complete`,
+          payload: { token, accountName: 'Synthetic account' },
+        });
+        assert.equal(completed.statusCode, 200, completed.body);
+      }
+      const connected = (await discovered.list()).find((app) => app.slug === definition.slug)!;
+      assert(connected?.connectionId);
+      const known = (await discovered.servers())[0];
+      const args = {
+        connectionId: connected.connectionId,
+        pathId: known.pathId,
+        tool: definition.contract.tool.name,
+        input: definition.contract.input,
+      };
+      const output = await discovered.execute('CONNECTED_MCP_CALL', args, {
+        threadId: randomUUID(),
+        turnId: randomUUID(),
+      });
+      assert(!JSON.stringify(output).includes(token));
+      assert.equal(dispatched, 1);
+      await assert.rejects(
+        discovered.execute(
+          'CONNECTED_MCP_CALL',
+          { ...args, pathId: randomUUID() },
+          { threadId: randomUUID(), turnId: randomUUID() },
+        ),
+      );
+      assert.equal(dispatched, 1);
+      await discovered.disconnect(connected.connectionId, definition.slug);
+      await assert.rejects(
+        discovered.execute('CONNECTED_MCP_CALL', args, {
+          threadId: randomUUID(),
+          turnId: randomUUID(),
+        }),
+      );
+      assert.equal(dispatched, 1);
+    },
+  );
 
 const fixtureIdentityCheckpoint = {
   read: async () => undefined,
@@ -682,7 +1894,7 @@ test('managed integration requests bind SDK calls to a private persisted install
   let failExecution = false;
   let uploadResponse = 'nod-file.synthetic-owned-capability';
   let uploadName = 'synthetic.bin';
-  let failUpload = false;
+  let uploadRefusal: { error: string; status: number } | undefined;
   let pairingStatus: unknown = { pairingConfirmed: false };
   let expectedToolkit = 'gmail';
   let expectedReconnectAccountId: string | undefined;
@@ -817,7 +2029,8 @@ test('managed integration requests bind SDK calls to a private persisted install
         mimeType: 'application/octet-stream',
         data: 'AP/+CkGA',
       });
-      if (failUpload) return Response.json({ error: 'upload_failed' }, { status: 503 });
+      if (uploadRefusal)
+        return Response.json({ error: uploadRefusal.error }, { status: uploadRefusal.status });
       return Response.json({
         name: uploadName,
         mimetype: 'application/octet-stream',
@@ -1093,10 +2306,19 @@ test('managed integration requests bind SDK calls to a private persisted install
   uploadName = file.name;
   uploadResponse = 'raw-project-file-key';
   await assert.rejects(session.upload!('GMAIL_SEND_EMAIL', file, undefined, 'ca_fixture_proxy'));
-  failUpload = true;
+  uploadRefusal = { error: 'file_verification_failed', status: 502 };
   const beforeUploadFailure = calls.length;
-  await assert.rejects(session.upload!('GMAIL_SEND_EMAIL', file, undefined, 'ca_fixture_proxy'));
+  await assert.rejects(
+    session.upload!('GMAIL_SEND_EMAIL', file, undefined, 'ca_fixture_proxy'),
+    /file_verification_failed\. HTTP 502\./,
+  );
   assert.equal(calls.length, beforeUploadFailure + 1);
+  uploadRefusal = { error: 'synthetic-private-detail', status: 503 };
+  await assert.rejects(
+    session.upload!('GMAIL_SEND_EMAIL', file, undefined, 'ca_fixture_proxy'),
+    (error: Error) => /HTTP 503\./.test(error.message) && !error.message.includes('synthetic'),
+  );
+  uploadRefusal = undefined;
   const beforeInvalidUpload = calls.length;
   await assert.rejects(
     session.upload!(
@@ -1212,6 +2434,277 @@ test('managed integration requests bind SDK calls to a private persisted install
   }
 });
 
+test('a refused broker request keeps the broker status and only known codes', async (t) => {
+  const refusingProxy = async (
+    t: TestContext,
+    respond: (path: string, body: Record<string, unknown>, signal: AbortSignal) => Response,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), 'nod-connect-refusal-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const proxy = createComposioProxy({
+      dataRoot: root,
+      ownerId: 'fixture-owner',
+      keyStore: installationKeyStore,
+      checkpoint: fixtureIdentityCheckpoint,
+      url: 'https://proxy.example.test',
+      browser: eagerConnectionBrowser(),
+      request: async (input, init) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        if (path === '/v2/access/enroll')
+          return Response.json({ state: 'enabled', userId: proxy.userId });
+        return respond(path, JSON.parse(await request.text()), request.signal);
+      },
+    });
+    await proxy.initialize();
+    return proxy;
+  };
+  const start = (proxy: ReturnType<typeof createComposioProxy>) =>
+    proxy.authorize(
+      'gmail',
+      `http://localhost:4310/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+    );
+  const refusal = (proxy: ReturnType<typeof createComposioProxy>) =>
+    start(proxy).then(
+      () => assert.fail('The refused connection start resolved.'),
+      (error: unknown) => error,
+    );
+  for (const [status, body, reason, code] of [
+    [429, '{"error":"rate_limited"}', 'rate_limit', 'rate_limited'],
+    [429, '{"error":"public_budget_exceeded"}', 'rate_limit', 'public_budget_exceeded'],
+    [429, '{"error":"provider_rate_limited"}', 'rate_limit', 'provider_rate_limited'],
+    [503, '{"error":"service_unavailable"}', 'unavailable', 'service_unavailable'],
+    [503, '{"error":"provider_unavailable"}', 'unavailable', 'provider_unavailable'],
+    [502, '{"error":"provider_request_failed"}', 'unavailable', 'provider_request_failed'],
+    [503, '{"error":"connections_unavailable"}', 'unavailable', 'connections_unavailable'],
+    [403, '{"error":"installation_revoked"}', 'permission', 'installation_revoked'],
+    [409, '{"error":"account_revoking"}', 'invalid_request', 'account_revoking'],
+    [400, '{"error":"invalid_callback"}', 'invalid_request', 'invalid_callback'],
+    [401, '{"error":"expired_authentication"}', 'authorization', 'expired_authentication'],
+    [415, '{"error":"json_required"}', 'invalid_request', 'json_required'],
+    [413, '{"error":"request_too_large"}', 'invalid_request', 'request_too_large'],
+    [408, '{"error":"request_timeout"}', 'timeout', 'request_timeout'],
+    [403, '{"error":"synthetic-private-detail"}', 'permission', undefined],
+    [500, 'synthetic upstream page', 'unavailable', undefined],
+  ] as const) {
+    await t.test(`HTTP ${status}`, async (t) => {
+      const proxy = await refusingProxy(t, (path) => {
+        assert.equal(path, '/v2/connect/start');
+        return new Response(body, {
+          status,
+          headers: { 'Content-Type': body.startsWith('{') ? 'application/json' : 'text/html' },
+        });
+      });
+      const error = await refusal(proxy);
+      assert.ok(error instanceof IntegrationConnectionError);
+      assert.equal(error.status, status);
+      assert.equal(error.reason, reason);
+      assert.equal(error.code, code);
+      assert.equal(error.phase, 'link');
+      assert.doesNotMatch(error.message, /synthetic/);
+    });
+  }
+  for (const variant of ['declared', 'streamed'] as const) {
+    await t.test(`${variant} refusal body over the size limit`, async (t) => {
+      let pulled = 0;
+      let cancelled = false;
+      const chunk = new TextEncoder().encode(
+        `{"error":"public_budget_exceeded","padding":"${'x'.repeat(8_000)}`,
+      );
+      const proxy = await refusingProxy(
+        t,
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                pull(controller) {
+                  pulled += chunk.byteLength;
+                  controller.enqueue(chunk);
+                },
+                cancel() {
+                  cancelled = true;
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            {
+              status: 503,
+              headers: {
+                'Content-Type': 'application/json',
+                ...(variant === 'declared' ? { 'Content-Length': '40000' } : {}),
+              },
+            },
+          ),
+      );
+      const error = await refusal(proxy);
+      assert.ok(error instanceof IntegrationConnectionError);
+      assert.equal(error.status, 503);
+      assert.equal(error.code, undefined);
+      assert.equal(cancelled, true);
+      if (variant === 'declared') assert.equal(pulled, 0);
+      else assert.ok(pulled <= 32_768 + chunk.byteLength, `read ${pulled} bytes`);
+    });
+  }
+  await t.test('a caller cancellation while the refusal is read', async (t) => {
+    const controller = new AbortController();
+    const cancellation = new Error('Synthetic caller cancellation.');
+    const proxy = await refusingProxy(t, (path, body) => {
+      if (path === '/v2/connect/start')
+        return Response.json({
+          redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+          transactionId: body.transactionId,
+        });
+      assert.equal(path, '/v2/connect/status');
+      controller.abort(cancellation);
+      return Response.json({ error: 'service_unavailable' }, { status: 503 });
+    });
+    const attempt = await start(proxy);
+    await assert.rejects(proxy.connectionStatus(attempt.url, controller.signal), (error) => {
+      assert.equal(error, cancellation);
+      return true;
+    });
+  });
+  await t.test('an internal timeout while the refusal is read', async (t) => {
+    const timeout = new AbortController();
+    const expired = new DOMException('Synthetic deadline.', 'TimeoutError');
+    let pulls = 0;
+    const proxy = await refusingProxy(t, (path, body) => {
+      if (path === '/v2/connect/start')
+        return Response.json({
+          redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+          transactionId: body.transactionId,
+        });
+      assert.equal(path, '/v2/connect/status');
+      return new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              pulls++;
+              timeout.abort(expired);
+              controller.error(expired);
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        { status: 503 },
+      );
+    });
+    const attempt = await start(proxy);
+    t.mock.method(AbortSignal, 'timeout', () => timeout.signal);
+    await assert.rejects(proxy.connectionStatus(attempt.url), (error) => {
+      assert.equal(error, expired);
+      return true;
+    });
+    assert.equal(pulls, 1);
+  });
+  await t.test('failure logging keeps only numeric HTTP status', (t) => {
+    const entries: Array<{ status?: number }> = [];
+    t.mock.method(console, 'error', (line: string) => {
+      entries.push(JSON.parse(line));
+    });
+    for (const status of [429, 'synthetic-private-status', 0, 600, 429.5])
+      logFailure('app_connection_start', { status });
+    assert.deepEqual(
+      entries.map((entry) => entry.status),
+      [429, undefined, undefined, undefined, undefined],
+    );
+  });
+  await t.test('enrollment during an app catalog request', async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'nod-enroll-refusal-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const proxy = createComposioProxy({
+      dataRoot: root,
+      ownerId: 'fixture-owner',
+      keyStore: installationKeyStore,
+      checkpoint: fixtureIdentityCheckpoint,
+      url: 'https://proxy.example.test',
+      request: async (input, init) => {
+        assert.equal(new URL(new Request(input, init).url).pathname, '/v2/access/enroll');
+        return Response.json({ error: 'public_budget_exceeded' }, { status: 429 });
+      },
+    });
+    await proxy.initialize();
+    await assert.rejects(
+      createComposioProvider({ proxy }).listServices!(),
+      (error: unknown) =>
+        error instanceof IntegrationCatalogFailure &&
+        error.status === 429 &&
+        error.code === 'public_budget_exceeded',
+    );
+  });
+  for (const [skew, accepted] of [
+    [-30_000, true],
+    [10 * 60_000, true],
+    [-30_000, false],
+  ] as const) {
+    await t.test(
+      `a computer clock ${Math.abs(skew / 1000)}s ${skew < 0 ? 'fast' : 'slow'} ${accepted ? 'connects' : 'keeps a repeated refusal'}`,
+      async (t) => {
+        const root = await mkdtemp(join(tmpdir(), 'nod-clock-skew-'));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        const signed: Array<{ path: string; current: boolean }> = [];
+        const requestIds: string[] = [];
+        const proxy = createComposioProxy({
+          dataRoot: root,
+          ownerId: 'fixture-owner',
+          keyStore: installationKeyStore,
+          checkpoint: fixtureIdentityCheckpoint,
+          url: 'https://proxy.example.test',
+          browser: eagerConnectionBrowser(),
+          request: async (input, init) => {
+            const request = new Request(input, init);
+            const path = new URL(request.url).pathname;
+            const service = Date.now() + skew;
+            const issuedAt = Number(request.headers.get('x-nod-timestamp')) * 1000;
+            requestIds.push(request.headers.get('x-nod-request-id') ?? '');
+            const current = accepted && issuedAt >= service - 60_000 && issuedAt <= service + 5_000;
+            signed.push({ path, current });
+            const headers = { Date: new Date(service).toUTCString() };
+            if (!current)
+              return Response.json({ error: 'expired_authentication' }, { status: 401, headers });
+            if (path === '/v2/access/enroll')
+              return Response.json({ state: 'enabled', userId: proxy.userId }, { headers });
+            assert.equal(path, '/v2/connect/start');
+            return Response.json(
+              {
+                redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+                transactionId: JSON.parse(await request.text()).transactionId,
+              },
+              { headers },
+            );
+          },
+        });
+        await proxy.initialize();
+        const attempt = proxy.authorize(
+          'gmail',
+          `http://localhost:4310/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+        );
+        if (accepted) {
+          await attempt;
+          assert.deepEqual(signed, [
+            { path: '/v2/access/enroll', current: false },
+            { path: '/v2/access/enroll', current: true },
+            { path: '/v2/connect/start', current: true },
+          ]);
+          assert.equal(new Set(requestIds).size, requestIds.length);
+          return;
+        }
+        await assert.rejects(attempt, (error: unknown) => {
+          assert.ok(error instanceof IntegrationConnectionError);
+          assert.equal(error.status, 401);
+          assert.equal(error.code, 'expired_authentication');
+          return true;
+        });
+        assert.deepEqual(signed, [
+          { path: '/v2/access/enroll', current: false },
+          { path: '/v2/access/enroll', current: false },
+        ]);
+        assert.equal(new Set(requestIds).size, requestIds.length);
+      },
+    );
+  }
+});
+
 test('hosted app connection bridge keeps browser proof on the configured origin', async (t) => {
   for (const [origin, service] of [
     ['https://nod.customer.example', 'gmail'],
@@ -1229,6 +2722,8 @@ test('hosted app connection bridge keeps browser proof on the configured origin'
       browser.registerRoutes(app);
       const brokerOrigin = 'https://proxy.example.test';
       const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+      let bridgeUrl = '';
+      let bridgeOpenDuringCompletion: boolean | undefined;
       const proxy = createComposioProxy({
         dataRoot: root,
         ownerId: 'hosted-fixture-owner',
@@ -1243,6 +2738,14 @@ test('hosted app connection bridge keeps browser proof on the configured origin'
           calls.push({ path, body });
           if (path === '/v2/access/enroll')
             return Response.json({ state: 'enabled', userId: proxy.userId });
+          if (path === '/v2/connect/complete') {
+            bridgeOpenDuringCompletion = browser.owns(bridgeUrl);
+            return Response.json({
+              connectedAccountId: 'ca_synthetic_hosted',
+              toolkit: service,
+              status: 'ACTIVE',
+            });
+          }
           assert.equal(path, '/v2/connect/start');
           assert.equal(body.toolkit, service);
           assert.equal('native' in body, false);
@@ -1255,6 +2758,7 @@ test('hosted app connection bridge keeps browser proof on the configured origin'
       const state = randomBytes(32).toString('base64url');
       const callback = `${origin}/api/apps/callback?state=${state}`;
       const attempt = await proxy.authorize(service, callback);
+      bridgeUrl = attempt.url;
       const url = new URL(attempt.url);
       assert.equal(url.origin, origin);
       assert.match(url.pathname, /^\/api\/apps\/connect\/[A-Za-z0-9_-]{43}$/);
@@ -1353,7 +2857,16 @@ test('hosted app connection bridge keeps browser proof on the configured origin'
       assert.equal((await app.inject({ url: url.pathname, headers })).statusCode, 403);
       assert.equal((await post({ origin, 'x-nod-bridge': bridgeKey })).statusCode, 403);
       assert.equal(calls.length, 2);
-      browser.finish(state);
+      const completed = await proxy.parseCallback(
+        { state, completion_token: 'synthetic-completion' },
+        {
+          accountId: attempt.accountId,
+          verificationSecret: attempt.verificationSecret,
+          service,
+        },
+      );
+      assert.equal(completed.accountId, 'ca_synthetic_hosted');
+      assert.equal(bridgeOpenDuringCompletion, false);
       assert.equal(browser.owns(attempt.url), false);
       assert.equal(browser.remote(attempt.url), undefined);
       assert.equal((await app.inject({ url: url.pathname, headers })).statusCode, 403);
@@ -1377,6 +2890,7 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
   for (const variant of [
     'expired',
     'broker-failure',
+    'broker-refusal',
     'foreign-broker',
     'invalid-key',
     'cancelled-start',
@@ -1400,6 +2914,13 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
             await continueStart;
           }
           if (variant === 'broker-failure') throw new Error('Synthetic broker failure.');
+          if (variant === 'broker-refusal')
+            throw new IntegrationConnectionError(
+              'rate_limit',
+              'link',
+              429,
+              'public_budget_exceeded',
+            );
           return variant === 'foreign-broker'
             ? 'https://attacker.example.test/v2/connect/pair?ticket=synthetic'
             : brokerOrigin + '/v2/connect/pair?ticket=synthetic';
@@ -1433,6 +2954,11 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
         }
         const started = await pending;
         assert.equal(started.statusCode, variant === 'expired' ? 403 : 400, started.body);
+        if (variant === 'broker-refusal') {
+          assert.match(started.json().error, /public_budget_exceeded/);
+          assert.match(started.json().error, /HTTP 429/);
+        }
+        if (variant === 'broker-failure') assert.doesNotMatch(started.body, /Synthetic/);
         assert.equal(starts, ['expired', 'invalid-key'].includes(variant) ? 0 : 1);
         assert.equal(browser.owns(url.href), false);
         assert.equal(browser.remote(url.href), undefined);
@@ -1443,6 +2969,158 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
     });
   }
 });
+
+test('connection bridges record the step where an expired attempt stopped', async (t) => {
+  const brokerOrigin = 'https://proxy.example.test';
+  const pair = `${brokerOrigin}/v2/connect/pair?ticket=synthetic-expiry`;
+  const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({
+    format: 'jwk',
+  });
+  const expire = async (open: () => Promise<string>, advance: (url: string) => Promise<void>) => {
+    let expiry = () => {};
+    const timer = t.mock.method(globalThis, 'setTimeout', ((callback: () => void) => {
+      expiry = callback;
+      return { unref() {} };
+    }) as unknown as typeof setTimeout);
+    let url: string;
+    try {
+      url = await open();
+    } finally {
+      timer.mock.restore();
+    }
+    await advance(url);
+    const logged: Array<Record<string, unknown>> = [];
+    withFailureLog((event, _error, context) => logged.push({ event, ...context }), expiry);
+    return logged;
+  };
+  await t.test('loopback', async (t) => {
+    const browser = createIntegrationBrowser();
+    t.after(() => browser.close());
+    for (const [step, reached] of [
+      ['open', 0],
+      ['start', 1],
+      ['consent', 2],
+      ['callback', 3],
+      [undefined, 4],
+    ] as const) {
+      const id = randomBytes(32).toString('base64url');
+      let returnPath = '';
+      const logged = await expire(
+        () =>
+          browser.open(id, brokerOrigin, async (_key, _origin, native) => {
+            returnPath = native!.returnPath;
+            return pair;
+          }),
+        async (url) => {
+          const origin = new URL(url).origin;
+          if (reached < 1) return;
+          const bridgeKey = JSON.parse(
+            (await (await fetch(url)).text()).match(/const bridgeKey=("[^"]+");/)![1],
+          );
+          if (reached < 2) return;
+          const started = await fetch(`${origin}/start`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin, 'x-nod-bridge': bridgeKey },
+            body: JSON.stringify({ browserKey: key }),
+          });
+          assert.equal(started.status, 200, await started.text());
+          if (reached < 3) return;
+          const returned = await fetch(origin + returnPath, { headers: { origin: brokerOrigin } });
+          assert.equal(returned.status, 200, await returned.text());
+          if (reached < 4) return;
+          browser.finish(id);
+        },
+      );
+      assert.deepEqual(logged, step ? [{ event: 'app_connection_expired', step }] : []);
+    }
+  });
+  await t.test('hosted', async (t) => {
+    const origin = 'https://nod.customer.example';
+    const browser = createIntegrationBrowser({ origin });
+    t.after(() => browser.close());
+    const app = Fastify();
+    t.after(() => app.close());
+    registerLocalAccess(app, 4310, { key: 'synthetic-owner-key', origin });
+    browser.registerRoutes(app);
+    const headers = { host: new URL(origin).host };
+    for (const [step, reached] of [
+      ['open', 0],
+      ['start', 1],
+      ['consent', 2],
+      [undefined, 3],
+    ] as const) {
+      const id = randomBytes(32).toString('base64url');
+      const logged = await expire(
+        () => browser.open(id, brokerOrigin, async () => pair),
+        async (url) => {
+          const path = new URL(url).pathname;
+          if (reached < 1) return;
+          const bootstrap = await app.inject({ url: path, headers });
+          const { bridgeKey } = JSON.parse(
+            bootstrap.body.match(/const \{brokerOrigin,id,expiresAt,bridgeKey\}=(.+);/)![1],
+          );
+          if (reached < 2) return;
+          const started = await app.inject({
+            method: 'POST',
+            url: path,
+            headers: { ...headers, origin, 'x-nod-bridge': bridgeKey },
+            payload: { browserKey: key },
+          });
+          assert.equal(started.statusCode, 200, started.body);
+          if (reached < 3) return;
+          browser.finish(id);
+        },
+      );
+      assert.deepEqual(logged, step ? [{ event: 'app_connection_expired', step }] : []);
+    }
+  });
+});
+
+test(
+  'a sign-in that returns after its link expired records a timeout',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    for (const clock of ['in-sync', 'server-behind-database', 'server-ahead-of-database'] as const)
+      await t.test(clock, async (t) => {
+        const captured: import('../src/server/analytics.ts').AnalyticsEvent[] = [];
+        const f = await appsFixture(t, {}, { analytics: (event) => captured.push(event) });
+        const started = await f.app.inject({
+          method: 'POST',
+          url: '/api/apps/gmail/connect',
+          payload: { returnTo: 'window' },
+        });
+        assert.equal(started.statusCode, 200, started.body);
+        const callback = new URL(f.callbacks.at(-1)!);
+        callback.searchParams.set('account', [...f.accounts.keys()].at(-1)!);
+        const valid = clock === 'server-ahead-of-database';
+        if (!valid)
+          await f.pool.query(
+            "UPDATE app_connections SET callback_expires=now()-interval '1 minute'",
+          );
+        if (clock !== 'in-sync') {
+          const now = Date.now() + (valid ? 15 : -5) * 60_000;
+          t.mock.method(Date, 'now', () => now);
+        }
+        const late = await f.app.inject({ url: callback.pathname + callback.search });
+        assert.equal(
+          new URL(late.headers.location!).searchParams.get('connection'),
+          valid ? 'connected' : 'expired',
+        );
+        assert.deepEqual(
+          captured.flatMap((entry) =>
+            entry.event === 'connection_changed'
+              ? [[entry.properties.status, entry.properties.failure_reason]]
+              : [],
+          ),
+          [['started', undefined], valid ? ['connected', undefined] : ['failed', 'timeout']],
+        );
+        assert.equal(
+          (await f.pool.query('SELECT count(*)::int AS n FROM app_connections')).rows[0].n,
+          valid ? 1 : 0,
+        );
+      });
+  },
+);
 
 test('hosted connection proof signs only the opened broker popup challenge for its exact attempt', async (t) => {
   for (const variant of ['valid', 'expires-before-sign', 'expires-during-sign']) {
@@ -3730,6 +5408,7 @@ test(
         return true;
       };
       let discoveredState = '';
+      let rejection: Error | undefined;
       const discovered = await createDiscoveredConnections(f.pool, {
         ownerId,
         baseUrl: 'http://127.0.0.1:4310',
@@ -3743,6 +5422,7 @@ test(
         },
         oauth: {
           begin: async (_endpoint, redirectUri, state) => {
+            if (rejection) throw rejection;
             discoveredState = state;
             return { url: 'https://fixture.example/authorize', saved: { redirectUri } };
           },
@@ -3813,6 +5493,37 @@ test(
           turn,
         );
         const id = new URL(proposal.url, 'http://localhost').searchParams.get('connect');
+        rejection = new Error(
+          'Synthetic redirect address not approved. Bearer synthetic-provider-secret',
+        );
+        const rejected = await app.inject({
+          method: 'POST',
+          url: `/api/apps/discovery/${id}/authorize`,
+          headers,
+          payload: {},
+        });
+        rejection = undefined;
+        assert.equal(rejected.statusCode, 502, rejected.body);
+        assert.match(rejected.body, /Synthetic redirect address not approved\./);
+        assert.doesNotMatch(rejected.body, /synthetic-provider-secret/);
+        for (const [cause, expected] of [
+          [Object.assign(new Error(''), { errorCode: 'invalid_client' }), 'invalid_client'],
+          [new Error('x'.repeat(5000)), 'x'.repeat(500)],
+        ] as const) {
+          rejection = cause;
+          const refused = await app.inject({
+            method: 'POST',
+            url: `/api/apps/discovery/${id}/authorize`,
+            headers,
+            payload: {},
+          });
+          rejection = undefined;
+          assert.equal(
+            refused.json().error,
+            `The service sign-in could not start: ${expected}`,
+            refused.body,
+          );
+        }
         const begin = await app.inject({
           method: 'POST',
           url: `/api/apps/discovery/${id}/authorize`,
@@ -3908,6 +5619,7 @@ test(
           ...(await f.session.authorize(service, callback)),
           authConfigId: 'synthetic-auth-config',
         });
+        let rejection: Error | undefined;
         const discovered = await createDiscoveredConnections(f.pool, {
           ownerId,
           baseUrl,
@@ -3923,10 +5635,13 @@ test(
             callTool: async () => ({}),
           },
           oauth: {
-            begin: async (_endpoint, redirectUri, state) => ({
-              url: `https://consent.fixture.example/authorize?state=${state}`,
-              saved: { redirectUri },
-            }),
+            begin: async (_endpoint, redirectUri, state) => {
+              if (rejection) throw rejection;
+              return {
+                url: `https://consent.fixture.example/authorize?state=${state}`,
+                saved: { redirectUri },
+              };
+            },
             finish: async (_endpoint, saved) => ({
               ...saved,
               tokens: { access_token: 'synthetic-access-token', token_type: 'Bearer' },
@@ -4006,6 +5721,14 @@ test(
           await complete(restarted.json().attempt, returnTo, 'notion');
           const addressed = await post('/api/apps/n8n/connect', { returnTo });
           const proposalId = new URL(addressed.json().url, baseUrl).searchParams.get('connect');
+          rejection = new Error('Synthetic metadata not found.');
+          const refused = await post(`/api/apps/discovery/${proposalId}/instance`, {
+            instanceUrl: `https://${returnTo}.n8n.example`,
+            returnTo,
+          });
+          rejection = undefined;
+          assert.equal(refused.statusCode, 502, refused.body);
+          assert.match(refused.body, /did not answer at .*Synthetic metadata not found\./);
           const instance = await post(`/api/apps/discovery/${proposalId}/instance`, {
             instanceUrl: `https://${returnTo}.n8n.example`,
             returnTo,
@@ -6536,6 +8259,7 @@ function composioProxyFixture(
     parseCallback: async () => assert.fail('Unexpected fixture callback.'),
     upload: async () => assert.fail('Unexpected fixture upload.'),
     isPendingAccount: () => false,
+    backoff: () => undefined,
     ...overrides,
   };
 }
@@ -7373,6 +9097,143 @@ test(
       assert.equal(Object.hasOwn(view.json(), 'callbackUrl'), false);
     }
     assert.equal((await pool.query('SELECT id FROM discovered_connections')).rowCount, 0);
+  },
+);
+
+test(
+  'manual MCP setup accepts an owner-typed private address and binds it to that origin',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_manual_local_mcp_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    const app = Fastify();
+    t.after(async () => {
+      await app.close();
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const ownerId = 'fixture-local-mcp-owner';
+    const key = randomBytes(32);
+    const keyStore = { id: 'fixture', configured: true, getKey: async () => key };
+    const grantVault = await createAppGrantVault(pool, { ownerId, keyStore });
+    const unused = async () => {
+      throw new Error('Proposal creation must not call the remote server.');
+    };
+    const oauth: Parameters<typeof createDiscoveredConnections>[1]['oauth'] = {
+      begin: unused,
+      finish: unused,
+      refresh: unused,
+    };
+    const origins: string[] = [];
+    const options = {
+      ownerId,
+      baseUrl: 'http://localhost:4310',
+      grantVault,
+      transport: createDiscoveredTransport(unused),
+      oauth,
+      local: (origin: string) => {
+        origins.push(origin);
+        const check = ownerAddress(origin);
+        return {
+          transport: createDiscoveredTransport(unused, async (endpoint) => {
+            const { url } = await check(endpoint);
+            if (url.hash || url.search) throw new Error('Use an address without a query.');
+            return url.href;
+          }),
+          oauth,
+        };
+      },
+    };
+    const connections = await createDiscoveredConnections(pool, options);
+    connections.registerRoutes(app);
+    const create = (endpoint: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/apps/mcp',
+        payload: { name: 'Local MCP', endpoint, auth: 'bearer' },
+      });
+    const accepted = await create('http://127.0.0.1:4931/mcp');
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    const saved = (
+      await pool.query('SELECT paths FROM discovered_connection_proposals WHERE id=$1', [
+        accepted.json().id,
+      ])
+    ).rows[0];
+    assert.deepEqual(saved.paths, [
+      {
+        id: accepted.json().id,
+        kind: 'mcp',
+        endpoint: 'http://127.0.0.1:4931/mcp',
+        auth: 'bearer',
+        local: true,
+      },
+    ]);
+    assert.deepEqual(origins, ['http://127.0.0.1:4931', 'http://127.0.0.1:4931']);
+    const schemeless = await create('127.0.0.1:4931/mcp');
+    assert.equal(schemeless.statusCode, 200, schemeless.body);
+    assert.equal(
+      (
+        await pool.query('SELECT paths FROM discovered_connection_proposals WHERE id=$1', [
+          schemeless.json().id,
+        ])
+      ).rows[0].paths[0].endpoint,
+      'https://127.0.0.1:4931/mcp',
+    );
+    for (const endpoint of [
+      'http://93.184.216.34/mcp',
+      'http://127.0.0.1:4931/mcp?token=synthetic',
+      'http://user:synthetic@127.0.0.1:4931/mcp',
+      'ftp://127.0.0.1:4931/mcp',
+      'file:///synthetic/mcp',
+      'data:text/plain,synthetic',
+    ]) {
+      const rejected = await create(endpoint);
+      assert.equal(rejected.statusCode, 400, rejected.body);
+    }
+    const service = 'mcp-synthetic-local';
+    await pool.query(
+      `INSERT INTO discovered_connections (id,owner_id,service,name,account_name,paths,reconnect_required)
+       VALUES($1,$2,$3,'Local MCP','Local MCP',$4,true)`,
+      [
+        randomUUID(),
+        ownerId,
+        service,
+        JSON.stringify([
+          {
+            id: randomUUID(),
+            kind: 'mcp',
+            endpoint: 'http://127.0.0.1:4931/mcp',
+            auth: 'bearer',
+            local: true,
+          },
+        ]),
+      ],
+    );
+    const reconnected = await connections.reconnect(service);
+    const renewed = (
+      await pool.query('SELECT paths FROM discovered_connection_proposals WHERE id=$1', [
+        new URL(reconnected.url, 'http://localhost').searchParams.get('connect'),
+      ])
+    ).rows[0];
+    assert.equal(renewed.paths[0].endpoint, 'http://127.0.0.1:4931/mcp');
+    assert.equal(renewed.paths[0].local, true);
+    const proposed = await connections
+      .propose({
+        name: 'Proposed',
+        service: 'proposed-local',
+        paths: [{ kind: 'mcp', endpoint: 'http://127.0.0.1:4931/mcp', auth: 'bearer' }],
+      })
+      .then(
+        () => 'accepted',
+        () => 'rejected',
+      );
+    assert.equal(proposed, 'rejected', 'A model proposal never reaches a private address.');
   },
 );
 
@@ -8723,6 +10584,30 @@ test(
       path.tools?.map((tool) => tool.name),
       ['notion-search', 'notion-fetch'],
     );
+    const until = Date.now() + 120_000;
+    const backoff = provider.connectionBackoff;
+    provider.connectionBackoff = () => ({
+      until,
+      status: 429,
+      code: 'installation_busy' as const,
+    });
+    try {
+      const paused = (await integrations.execute(
+        owner,
+        'SEARCH_TOOLS',
+        { query: 'Notion page' },
+        undefined,
+        undefined,
+        undefined,
+        'background',
+      )) as { incomplete: string; discovered: unknown[] };
+      assert.match(paused.incomplete, /installation_busy, HTTP 429/);
+      assert.ok(paused.incomplete.includes(new Date(until).toISOString()));
+      assert.match(paused.incomplete, /Do not retry this source now/);
+      assert.ok(paused.discovered.length);
+    } finally {
+      provider.connectionBackoff = backoff;
+    }
     const read = await integrations.execute(owner, 'CONNECTED_MCP_CALL', {
       connectionId: connected.connectionId,
       pathId: path.id,
@@ -9039,9 +10924,13 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
     next_cursor: null,
   }));
   let result: Record<string, unknown> = {};
+  let requestError: APIError | undefined;
   t.mock.method(client.sessions, 'create', async () => ({
     sessionId: 'fixture-session',
-    execute: async () => result,
+    execute: async () => {
+      if (requestError) throw requestError;
+      return result;
+    },
   }));
   const session = await createComposioProvider({
     proxy: composioProxyFixture(client, 'local-development'),
@@ -9145,6 +11034,72 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
     resultType: 'completed',
   };
   await session.execute('GMAIL_SEND_EMAIL', {}, 'fixture-account');
+  const diagnosticRedactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  for (const [ray, contentType] of [
+    ['230b030023ae2822-SJC', ' TEXT/HTML ; charset=UTF-8 '],
+    ['1234567890123456-SJC', 'text/html;charset=utf-8'],
+    ['private-fixture-ray', 'text/html'],
+    [undefined, 'text/html'],
+  ] as const) {
+    const headers = new Headers({
+      'content-type': contentType,
+      'x-private': 'private-fixture-header',
+    });
+    if (ray) headers.set('cf-ray', ray);
+    requestError = APIError.generate(
+      403,
+      undefined,
+      '<html>private-fixture-response-body</html>',
+      headers,
+    );
+    const started = Date.now();
+    await assert.rejects(
+      session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { status?: number }).status, 403);
+        assert.match(error.message, /HTTP 403/);
+        const timestamp = error.message.match(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/);
+        assert.ok(timestamp);
+        assert.ok(Date.parse(timestamp[0]) >= started - 1000);
+        assert.ok(Date.parse(timestamp[0]) <= Date.now() + 1000);
+        assert.doesNotMatch(error.message, /private-fixture/);
+        assert.equal(diagnosticRedactor.text(error.message), error.message);
+        assert.equal(
+          error.message.includes('0x230b030023ae2822-SJC'),
+          ray === '230b030023ae2822-SJC',
+        );
+        assert.equal(
+          error.message.includes('0x1234567890123456-SJC'),
+          ray === '1234567890123456-SJC',
+        );
+        assert.equal(error.cause, undefined);
+        return true;
+      },
+    );
+  }
+  requestError = APIError.generate(
+    403,
+    { error: 'installation_revoked' },
+    undefined,
+    new Headers({ 'content-type': 'application/json', 'cf-ray': '230b030023ae2822-SJC' }),
+  );
+  await assert.rejects(
+    session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+    (error: unknown) => error === requestError,
+  );
+  for (const contentType of ['text/plain', 'text/htmlish; charset=utf-8']) {
+    requestError = APIError.generate(
+      403,
+      undefined,
+      'synthetic-specific-provider-reason',
+      new Headers({ 'content-type': contentType, 'cf-ray': '230b030023ae2822-SJC' }),
+    );
+    await assert.rejects(
+      session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+      (error: unknown) => error === requestError,
+    );
+  }
 });
 
 test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
@@ -9334,6 +11289,333 @@ test('Composio catalog and connection requests classify HTTP failures without ex
     create.mock.restore();
   }
 });
+
+async function connectionServiceFixture(t: TestContext) {
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Unexpected external request in the connection service fixture.');
+  });
+  const root = await mkdtemp(join(tmpdir(), 'nod-connection-wait-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls: string[] = [];
+  let userId = '';
+  let reply: () => Response | Promise<Response> = () =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' });
+  const proxy = createComposioProxy({
+    dataRoot: root,
+    ownerId: 'fixture-owner',
+    keyStore: installationKeyStore,
+    checkpoint: fixtureIdentityCheckpoint,
+    url: 'https://proxy.example.test',
+    request: async (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname === '/v2/access/enroll') return Response.json({ state: 'enabled', userId });
+      calls.push(url.pathname);
+      if (url.pathname === '/v2/api/v3.1/tool_router/session')
+        return Response.json({
+          session_id: 'trs_fixture_wait',
+          mcp: { type: 'http', url: 'https://proxy.example.test/unsupported-mcp' },
+          config: { user_id: userId, toolkits: { enabled: ['gmail'] }, connected_accounts: {} },
+          config_version: 1,
+        });
+      return reply();
+    },
+  });
+  await proxy.initialize();
+  userId = proxy.userId;
+  const provider = createComposioProvider({ proxy });
+  return {
+    provider,
+    executions: () => calls.filter((path) => path.endsWith('/execute')).length,
+    reply: (next: () => Response | Promise<Response>) => {
+      reply = next;
+    },
+    send: async () =>
+      (await provider.createSession('fixture-owner', { gmail: 'ca_fixture_wait' })).execute(
+        'GMAIL_SEND_EMAIL',
+        { recipient_email: 'person@example.test' },
+        'ca_fixture_wait',
+      ),
+  };
+}
+
+const busyReply = (headers: Record<string, string> = {}) =>
+  Response.json({ error: 'installation_busy' }, { status: 429, headers });
+
+test('connection service refusals pause the install from Retry-After or a growing wait, and writes are never retried', async (t) => {
+  const service = await connectionServiceFixture(t);
+  const waited = () => {
+    const wait = service.provider.connectionBackoff!();
+    return wait && Math.round((wait.until - Date.now()) / 1000);
+  };
+  service.reply(() => busyReply({ 'retry-after': '120' }));
+  await assert.rejects(service.send());
+  assert.equal(service.executions(), 1);
+  assert.equal(service.provider.connectionBackoff!()?.status, 429);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'installation_busy');
+  assert.ok(Math.abs(waited()! - 120) <= 2);
+  service.reply(() => busyReply({ 'retry-after': new Date(Date.now() + 3_600_000).toUTCString() }));
+  await assert.rejects(service.send());
+  assert.ok(Math.abs(waited()! - 900) <= 2);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  assert.equal(service.provider.connectionBackoff!(), undefined);
+  service.reply(() => Response.json({ error: 'service_unavailable' }, { status: 503 }));
+  const growth = [];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await assert.rejects(service.send());
+    growth.push(waited());
+  }
+  assert.deepEqual(growth, [60, 120, 240, 480, 960, 1800, 1800]);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'service_unavailable');
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  service.reply(() => busyReply());
+  await assert.rejects(service.send());
+  assert.equal(waited(), 60);
+  assert.equal(service.executions(), 12);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let arrived = 0;
+  service.reply(async () => {
+    if (++arrived === 4) release();
+    await held;
+    return busyReply();
+  });
+  const concurrent = await Promise.allSettled([1, 2, 3, 4].map(() => service.send()));
+  assert.ok(concurrent.every((outcome) => outcome.status === 'rejected'));
+  assert.equal(waited(), 60);
+  service.reply(() => busyReply());
+  await assert.rejects(service.send());
+  assert.equal(waited(), 120);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  const gated = (answers: Response[]) => {
+    const gates: (() => void)[] = [];
+    let reached = () => {};
+    service.reply(async () => {
+      const answer = answers.shift();
+      await new Promise<void>((resolve) => {
+        gates.push(resolve);
+        reached();
+      });
+      return (
+        answer ??
+        Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' })
+      );
+    });
+    return {
+      open: (index: number) => gates[index]!(),
+      arrive: async (count: number) => {
+        while (gates.length < count)
+          await new Promise<void>((resolve) => {
+            reached = resolve;
+          });
+      },
+      sends: (count: number) =>
+        Array.from({ length: count }, () =>
+          service.send().then(
+            () => 'sent',
+            () => 'refused',
+          ),
+        ),
+    };
+  };
+  const overlap = gated([busyReply(), busyReply()]);
+  const earlier = overlap.sends(2);
+  await overlap.arrive(2);
+  overlap.open(0);
+  assert.equal(await Promise.race(earlier), 'refused');
+  const later = service.send();
+  await overlap.arrive(3);
+  overlap.open(1);
+  assert.deepEqual(await Promise.all(earlier), ['refused', 'refused']);
+  overlap.open(2);
+  await later;
+  assert.equal(waited(), 60);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  const stale = gated([busyReply(), busyReply()]);
+  const before = stale.sends(2);
+  await stale.arrive(2);
+  stale.open(0);
+  assert.equal(await Promise.race(before), 'refused');
+  const reset = service.send();
+  await stale.arrive(3);
+  stale.open(2);
+  await reset;
+  assert.equal(service.provider.connectionBackoff!(), undefined);
+  stale.open(1);
+  assert.deepEqual(await Promise.all(before), ['refused', 'refused']);
+  assert.equal(waited(), 60);
+});
+
+test(
+  'a connection service wait skips background reads across apps, refuses writes and lets an owner read try once',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    const gmail = await f.connect('gmail');
+    const slack = await f.connect('slack');
+    let reads = 0;
+    let polls = 0;
+    f.provider.activity = {
+      gmail: {
+        read: async () => {
+          reads++;
+          return { records: [] };
+        },
+      },
+    };
+    f.provider.pollInbox = async () => {
+      polls++;
+      return { cursor: 'synthetic-cursor', hasMore: false, messages: [] };
+    };
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const service = await connectionServiceFixture(t);
+    service.reply(() => busyReply({ 'retry-after': '120' }));
+    await assert.rejects(service.send());
+    f.provider.connectionBackoff = service.provider.connectionBackoff;
+    const until = new Date(Date.now() + 120_000).toISOString();
+    const signal = new AbortController().signal;
+    const sessions = f.sessions.length;
+    const background = () => [
+      f.service.readActivity({ connectionId: gmail.connectionId! }, signal),
+      f.service.execute(
+        'local-development',
+        'SLACK_LIST_CONVERSATIONS',
+        { connectionId: slack.connectionId },
+        undefined,
+        signal,
+        undefined,
+        'background',
+      ),
+    ];
+    await Promise.all(
+      background().map((read) =>
+        assert.rejects(read, (error: Error & { status?: number }) => {
+          assert.ok(
+            error.message.includes(
+              `rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until}`,
+            ),
+          );
+          assert.match(error.message, /Do not retry this source now/);
+          assert.equal(error.status, 429);
+          return true;
+        }),
+      ),
+    );
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=NULL WHERE id=$1', [
+      gmail.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal(
+      (
+        await f.pool.query('SELECT inbox_failed FROM app_connections WHERE id=$1', [
+          gmail.connectionId,
+        ])
+      ).rows[0].inbox_failed,
+      true,
+    );
+    await assert.rejects(
+      f.service.execute('local-development', 'SLACK_SEND_MESSAGE', {
+        connectionId: slack.connectionId,
+        channel: 'C0SYNTHETIC',
+        text: 'Synthetic update',
+      }),
+      (error: Error & { notRun?: boolean }) => {
+        assert.ok(error.message.includes(until));
+        assert.match(error.message, /did not send this action/);
+        assert.equal(error.notRun, true);
+        return true;
+      },
+    );
+    assert.deepEqual([reads, polls, f.executed.length, f.sessions.length], [0, 0, 0, sessions]);
+    await f.service.execute(
+      'local-development',
+      'SLACK_LIST_CONVERSATIONS',
+      { connectionId: slack.connectionId },
+      undefined,
+      signal,
+      undefined,
+      'read',
+    );
+    assert.equal(f.executed.length, 1);
+    t.mock.timers.tick(121_000);
+    await Promise.all(background());
+    assert.deepEqual([reads, f.executed.length, service.executions()], [1, 2, 1]);
+  },
+);
+
+for (const [status, code] of [
+  [429, 'installation_busy'],
+  [503, 'service_unavailable'],
+] as const) {
+  test(
+    `a ${status} on session create marks an approved write as not run`,
+    { skip: !process.env.TEST_DATABASE_URL },
+    async (t) => {
+      const f = await appsFixture(t);
+      const slack = await f.connect('slack');
+      t.mock.method(globalThis, 'fetch', async () => {
+        throw new Error('Unexpected external request in the session refusal test.');
+      });
+      const root = await mkdtemp(join(tmpdir(), 'nod-session-refusal-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      let userId = '';
+      const paths: string[] = [];
+      const proxy = createComposioProxy({
+        dataRoot: root,
+        ownerId: 'local-development',
+        keyStore: installationKeyStore,
+        checkpoint: fixtureIdentityCheckpoint,
+        url: 'https://proxy.example.test',
+        request: async (input, init) => {
+          const url = new URL(new Request(input, init).url);
+          if (url.pathname === '/v2/access/enroll')
+            return Response.json({ state: 'enabled', userId });
+          paths.push(url.pathname);
+          return Response.json({ error: code }, { status });
+        },
+      });
+      await proxy.initialize();
+      userId = proxy.userId;
+      const real = createComposioProvider({ proxy });
+      f.provider.createSession = (...input) => real.createSession(...input);
+      f.provider.connectionBackoff = real.connectionBackoff;
+      assert.equal(f.provider.connectionBackoff!(), undefined);
+      await assert.rejects(
+        f.service.execute('local-development', 'SLACK_SEND_MESSAGE', {
+          connectionId: slack.connectionId,
+          channel: 'C0SYNTHETIC',
+          text: 'Synthetic update',
+        }),
+        (error: Error & { notRun?: boolean; upstreamStatus?: number }) => {
+          assert.match(error.message, new RegExp(`${code}. HTTP ${status}`));
+          assert.equal(error.upstreamStatus, status);
+          assert.equal(error.notRun, true);
+          return true;
+        },
+      );
+      assert.deepEqual(paths, ['/v2/api/v3.1/tool_router/session']);
+      assert.equal(f.executed.length, 0);
+      assert.equal(f.provider.connectionBackoff!()?.status, status);
+    },
+  );
+}
 
 test('Composio proxy sessions omit SDK metadata and refuse unsupported webhooks', async (t) => {
   const client = new Composio({
@@ -9704,6 +11986,36 @@ test(
           .entries.map((entry: TrustEntry) => entry.id),
         [scheduled],
       );
+      const scheduleSignIn = randomUUID();
+      const scheduleBasis = {
+        kind: 'schedule',
+        messageId: said,
+        quote: 'Tell Sam we take the quote',
+      };
+      await pool.query(
+        "INSERT INTO vault_activity(id,owner_id,action,origin,item_kind,task,reason,basis) VALUES($1,'owner','sign_in','https://shop.example.test','login','Synthetic schedule','said_yes',$2)",
+        [scheduleSignIn, scheduleBasis],
+      );
+      const vaultPages = [
+        () => vaultAccess.within(null, null, null),
+        () => vaultAccess.ascending(null, null, null, 100),
+        () => vaultAccess.activity({}),
+      ];
+      for (const read of vaultPages)
+        assert.deepEqual(
+          (await read()).entries.find((entry) => entry.id === scheduleSignIn)?.because,
+          { kind: 'schedule', text: scheduleBasis.quote },
+        );
+      await pool.query('UPDATE vault_activity SET basis=$2 WHERE id=$1', [
+        scheduleSignIn,
+        { ...scheduleBasis, messageId: foreignSaid },
+      ]);
+      for (const read of vaultPages)
+        assert.equal(
+          (await read()).entries.find((entry) => entry.id === scheduleSignIn)?.because,
+          undefined,
+        );
+      await pool.query('DELETE FROM vault_activity WHERE id=$1', [scheduleSignIn]);
       await pool.query(
         `INSERT INTO vault_activity(id,owner_id,action,origin,item_kind,task,reason,amount_minor,currency) VALUES
           ($1,'owner','card','https://shop.example.test','card','=HYPERLINK("https://attacker.example.test")','said_yes',1200,'EUR'),
@@ -10727,34 +13039,46 @@ test('Composio inbox polling shares a bounded retry budget across Gmail reads', 
   assert.deepEqual([historyReads, firstReads, secondReads], [2, 2, 1]);
 });
 
-test('Composio inbox polling defers shared budget failures without retrying and cancels backoff', async (t) => {
-  let budgetRequests = 0;
-  const budgetPoll = inboxPollFixture(t, () => {
-    budgetRequests++;
-    throw APIError.generate(429, { error: 'public_budget_exceeded' }, undefined, new Headers());
-  });
-  await assert.rejects(
-    budgetPoll('inbox-account', null, new AbortController().signal),
-    (error: unknown) => {
-      assert.ok(error instanceof IntegrationInboxTransientError);
-      assert.equal(error.status, 429);
-      assert.equal(error.code, 'public_budget_exceeded');
-      assert.equal(error.retryAfterMs, 300_000);
-      return true;
-    },
-  );
-  assert.equal(budgetRequests, 1);
+test('Composio inbox polling defers proxy refusals, retries provider errors and cancels backoff', async (t) => {
+  for (const [status, code, retryAfterMs] of [
+    [429, 'public_budget_exceeded', 300_000],
+    [429, 'rate_limited', 60_000],
+    [429, 'installation_busy', 60_000],
+    [503, 'service_unavailable', 60_000],
+    [503, 'security_service_unavailable', 60_000],
+  ] as const) {
+    let requests = 0;
+    const poll = inboxPollFixture(t, () => {
+      requests++;
+      throw APIError.generate(status, { error: code }, undefined, new Headers());
+    });
+    await assert.rejects(
+      poll('inbox-account', null, new AbortController().signal),
+      (error: unknown) => {
+        assert.ok(error instanceof IntegrationInboxTransientError);
+        assert.equal(error.status, status);
+        assert.equal(error.code, code);
+        assert.equal(error.retryAfterMs, retryAfterMs);
+        return true;
+      },
+    );
+    assert.equal(requests, 1);
+  }
 
-  let unavailableRequests = 0;
-  const unavailablePoll = inboxPollFixture(t, () => {
-    unavailableRequests++;
-    if (unavailableRequests === 1)
-      throw APIError.generate(503, { error: 'service_unavailable' }, undefined, new Headers());
-    return { status: 200, data: { historyId: '200' } };
-  });
-  const recovered = await unavailablePoll('inbox-account', null, new AbortController().signal);
-  assert.equal(JSON.parse(recovered.cursor).historyId, '200');
-  assert.equal(unavailableRequests, 2);
+  for (const [status, code] of [
+    [429, 'rate_limited'],
+    [503, 'service_unavailable'],
+  ] as const) {
+    let providerRequests = 0;
+    const providerPoll = inboxPollFixture(t, () => {
+      providerRequests++;
+      if (providerRequests === 1) return { status, data: { error: code } };
+      return { status: 200, data: { historyId: '200' } };
+    });
+    const recovered = await providerPoll('inbox-account', null, new AbortController().signal);
+    assert.equal(JSON.parse(recovered.cursor).historyId, '200');
+    assert.equal(providerRequests, 2);
+  }
 
   const controller = new AbortController();
   let cancelledRequests = 0;
@@ -10985,7 +13309,7 @@ test('connected provider cancellation reaches session creation, search, schemas,
   assert.equal(requests.length, 4);
 });
 
-test('discovered requests follow redirects only to checked public addresses and drop credentials across origins', async () => {
+test('discovered requests identify Nod, follow redirects only to checked public addresses and drop credentials across origins', async () => {
   const { PassThrough } = await import('node:stream');
   const { EventEmitter } = await import('node:events');
   const sent: Array<{ url: string; authorization?: string }> = [];
@@ -11007,12 +13331,14 @@ test('discovered requests follow redirects only to checked public addresses and 
     'https://api.fixture.example/broken': { status: 302, location: 'https://[' },
   };
   const methods: string[] = [];
+  const agents: Array<string | undefined> = [];
   const request = ((
     url: URL,
     options: { method: string; headers: Record<string, string> },
     callback: (incoming: unknown) => void,
   ) => {
     methods.push(options.method);
+    agents.push(options.headers['user-agent']);
     sent.push({ url: url.href, authorization: options.headers.authorization });
     const route = routes[url.href]!;
     const incoming = Object.assign(new PassThrough(), {
@@ -11041,6 +13367,15 @@ test('discovered requests follow redirects only to checked public addresses and 
     { url: 'https://api.fixture.example/start', authorization: 'Bearer synthetic-token' },
     { url: 'https://files.fixture.example/data', authorization: undefined },
   ]);
+  assert.equal(agents.length, 2);
+  for (const agent of agents) assert.match(agent ?? '', /^nod\/\S+$/);
+  agents.length = 0;
+  await safeRemoteFetch(
+    'https://files.fixture.example/data',
+    { headers: { 'User-Agent': 'synthetic-client/2.0' } },
+    { validate, request },
+  );
+  assert.deepEqual(agents, ['synthetic-client/2.0']);
   await assert.rejects(
     safeRemoteFetch(
       'https://api.fixture.example/private',

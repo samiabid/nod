@@ -12,6 +12,7 @@ import pg from 'pg';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import type { AgentToolResult } from '../src/ports/agent.ts';
 import type { MessagingTransport } from '../src/ports/messaging.ts';
+import type { IntegrationBackoff } from '../src/ports/integrations.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
@@ -22,6 +23,7 @@ import { authenticatorCode } from '../src/server/authenticator.ts';
 import { transaction } from '../src/server/transaction.ts';
 import { createChannels } from '../src/server/channels.ts';
 import type { AppState, Task } from '../src/shared/contracts.ts';
+import type { WorkUsageResponse } from '../src/shared/models.ts';
 import { mergeMessages } from '../src/web/lib/chat-messages.ts';
 
 function syntheticConfirmation(input: Record<string, unknown>) {
@@ -112,7 +114,7 @@ test(
     const { createApplication } = await import('../src/server/composition.ts');
     const { pool } = await import('../src/server/db.ts');
     const { dataRoot, ownerId, port } = await import('../src/server/config.ts');
-    const { enqueueTurn } = await import('../src/server/thread.ts');
+    const { enqueueTurn, submitUserMessage } = await import('../src/server/thread.ts');
     const phases = new Map<string, number>();
     const results = new Map<string, AgentToolResult>();
     const plans = new Map<
@@ -125,6 +127,7 @@ test(
       {
         subagents: boolean;
         sequential?: boolean;
+        chatOnly?: boolean;
         calls: Array<{ tool?: string; action: string; args: Record<string, unknown> }>;
       }
     >();
@@ -164,11 +167,15 @@ test(
     let toolSearch: Record<string, unknown> | undefined;
     const readOnlyActions = new Set<string>();
     let appOutage = false;
+    let connectionWait: IntegrationBackoff | undefined;
+    let appSessions = 0;
     let appResult: unknown;
     let changeRulesOnDraftRead = false;
     let changedRulesDuringDraftRead = 0;
-    let repeatAfterConfirm: { action: string; args: Record<string, unknown> } | undefined;
+    let repeatAfterConfirm:
+      { tool?: string; action: string; args: Record<string, unknown> } | undefined;
     const prompts = new Map<string, string>();
+    const opened: Array<{ turnId: string; model?: string; helper: boolean }> = [];
     const integrationFixture = createIntegrationFixture(`http://localhost:${port}`);
     const { createModelService } = await import('../src/server/models.ts');
     const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
@@ -238,11 +245,16 @@ test(
           : task === 'review'
             ? (() => {
                 const words = input as {
-                  userMessages?: Array<{ text: string }>;
+                  userMessages?: Array<{ text: string; canAuthorize?: boolean }>;
                   userRules?: string;
                   action?: { name?: string; arguments?: { recipient_email?: unknown } };
                 };
                 ownerWords.push(...(words.userMessages ?? []).map((message) => message.text));
+                const fileRequest = words.action?.name?.startsWith('LOCAL_FILES_')
+                  ? words.userMessages?.findLast(
+                      (message) => message.canAuthorize !== false && asked.has(message.text),
+                    )?.text
+                  : undefined;
                 const metadataRead = [
                   'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID',
                   'GMAIL_GET_DRAFT',
@@ -251,7 +263,8 @@ test(
                   metadataRead && words.userRules === 'Ask before reading Gmail.';
                 const run =
                   !readRequiresConsent &&
-                  ((allowMethodBrowser && words.action?.name === 'NOD_browser') ||
+                  (Boolean(fileRequest) ||
+                    (allowMethodBrowser && words.action?.name === 'NOD_browser') ||
                     asked.has(words.userMessages?.at(-1)?.text ?? '') ||
                     cleared.has(String(words.action?.arguments?.recipient_email)) ||
                     metadataRead);
@@ -261,7 +274,7 @@ test(
                       because:
                         words.action?.name === 'GMAIL_FETCH_EMAILS' || metadataRead
                           ? 'read'
-                          : (words.userMessages?.at(-1)?.text ?? 'read'),
+                          : (fileRequest ?? words.userMessages?.at(-1)?.text ?? 'read'),
                     }
                   : { run, ...(readRequiresConsent ? { rule: true } : {}) };
               })()
@@ -273,6 +286,11 @@ test(
         models,
         agent: {
           async open(options) {
+            opened.push({
+              turnId: options.turnId,
+              model: options.model?.modelId,
+              helper: options.ephemeral === true,
+            });
             reportClosingUsage = () =>
               options.onEvent({
                 type: 'provider_usage',
@@ -302,7 +320,12 @@ test(
                 if (repeatAfterConfirm && text.includes('executed once by the trusted worker')) {
                   const call = repeatAfterConfirm;
                   repeatAfterConfirm = undefined;
-                  results.set(options.turnId, await tool('apps').execute(call));
+                  results.set(
+                    options.turnId,
+                    await tool(call.tool ?? 'apps').execute(
+                      call.tool === 'files' ? { action: call.action, ...call.args } : call,
+                    ),
+                  );
                   return;
                 }
                 const part = parts.get(
@@ -316,16 +339,21 @@ test(
                     .catch(() => {});
                   return;
                 }
-                const batch =
+                const planned =
                   phase === 0
                     ? batches.get(
                         JSON.parse(text.split('Request data (JSON):\n')[1]!.split('\n')[0]!)
                           .currentInstruction,
                       )
                     : undefined;
+                const batch =
+                  planned?.chatOnly && options.sessionId !== options.threadId ? undefined : planned;
                 if (batch) {
                   if (batch.sequential) {
-                    for (const call of batch.calls) await tool('apps').execute(call);
+                    for (const call of batch.calls)
+                      await (call.tool
+                        ? tool(call.tool).execute({ action: call.action, ...call.args })
+                        : tool('apps').execute(call));
                     return;
                   }
                   await Promise.allSettled(
@@ -367,7 +395,8 @@ test(
                             ? { input: plan.args }
                             : plan.tool === 'browser' ||
                                 plan.tool === 'sign_in' ||
-                                plan.tool === 'files'
+                                plan.tool === 'files' ||
+                                plan.tool === 'task'
                               ? { action: plan.action, ...plan.args }
                               : { action: plan.action, args: plan.args },
                       ),
@@ -455,7 +484,9 @@ test(
         }),
         integrations: {
           ...integrationFixture.provider,
+          connectionBackoff: () => connectionWait,
           createSession: async (...args) => {
+            appSessions++;
             const session = await integrationFixture.provider.createSession(...args);
             session.upload = async (_action, file) => {
               uploads.push(Buffer.from(file.bytes).toString());
@@ -649,13 +680,226 @@ test(
           await waitFor(response.json().turnId, 'succeeded');
           assert.deepEqual(models.view().selection, input);
           assert.equal((await approvalsFor(turn))[0].status, 'completed');
-          const directText = 'Use the first connected model again.';
+          const light = { connectionId: connection.id, modelId: 'gpt-6-luna' };
+          const directText =
+            'Use the first connected model again, your light model for your own checks, and the light model for the routed research.';
           asked.add(directText);
-          plans.set(directText, { action: 'model_select', args: { ...before! } });
+          batches.set(directText, {
+            subagents: false,
+            sequential: true,
+            chatOnly: true,
+            calls: [
+              { tool: 'manage_personal_context', action: 'model_select', args: { args: before! } },
+              {
+                tool: 'manage_personal_context',
+                action: 'model_select',
+                args: { args: { scope: 'background', use: 'light' } },
+              },
+              {
+                tool: 'task',
+                action: 'start',
+                args: {
+                  title: 'Routed research',
+                  doneWhen: 'Synthetic research is done.',
+                  now: 'Starting synthetic research.',
+                  message: 'Starting the synthetic research.',
+                  model: light,
+                },
+              },
+            ],
+          });
+          const errors = batchErrors.length;
           const direct = await request('POST', '/api/messages', { text: directText });
           await waitFor(direct.json().turnId, 'succeeded');
+          assert.deepEqual(batchErrors.slice(errors), []);
           assert.deepEqual(models.view().selection, before);
           assert.equal((await approvalsFor(direct.json().turnId)).length, 0);
+          assert.deepEqual(models.view().routes, { background: 'light' });
+          assert.equal(models.view().light?.modelId, 'gpt-6-luna');
+          assert.ok(
+            fallbackChecks.some((input) =>
+              JSON.stringify(input).includes('work Nod starts on its own'),
+            ),
+          );
+          assert.equal((await models.resolve()).definition.choice.id, 'gpt-6.1-sol');
+
+          const modelsOf = (turnId: string) =>
+            opened.filter((entry) => entry.turnId === turnId).map((entry) => entry.model);
+          const put = (url: string, payload: object) =>
+            application.app.inject({ method: 'PUT', url, headers, payload });
+          const task = (
+            await pool.query<{ id: string; model: { modelId: string } }>(
+              "SELECT id,model FROM tasks WHERE title='Routed research'",
+            )
+          ).rows[0]!;
+          assert.equal(task.model.modelId, 'gpt-6-luna');
+          const taskTurn = (
+            await pool.query<{ id: string }>('SELECT id FROM turns WHERE session_id=$1', [task.id])
+          ).rows[0]!;
+          await waitFor(taskTurn.id, 'succeeded|waiting');
+          assert.deepEqual(modelsOf(taskTurn.id), ['gpt-6-luna']);
+          const listed = (await request('GET', '/api/tasks'))
+            .json<Task[]>()
+            .find((item) => item.id === task.id)!;
+          assert.equal(listed.work, 'chat');
+
+          const unasked = `Synthetic unasked task model ${randomUUID()}`;
+          plans.set(unasked, {
+            tool: 'task',
+            action: 'start',
+            args: {
+              title: 'Unasked routed research',
+              doneWhen: 'Synthetic research is done.',
+              now: 'Starting synthetic research.',
+              message: 'Starting the synthetic research.',
+              model: light,
+            },
+          });
+          const refused = await enqueueTurn(unasked, { source: 'task', background: false });
+          await waitFor(refused, 'succeeded|failed');
+          assert.match(
+            (await pool.query('SELECT error FROM turns WHERE id=$1', [refused])).rows[0].error ??
+              JSON.stringify(results.get(refused)),
+            /did not ask for a model/,
+          );
+          assert.equal(
+            (await pool.query("SELECT 1 FROM tasks WHERE title='Unasked routed research'"))
+              .rowCount,
+            0,
+          );
+
+          const eventPrompt = `Synthetic app event ${randomUUID()}`;
+          batches.set(eventPrompt, {
+            subagents: true,
+            calls: [{ action: 'GMAIL_FETCH_EMAILS', args: { max_results: 1 } }],
+          });
+          const event = await enqueueTurn(eventPrompt, { source: 'event', background: true });
+          await waitFor(event, 'succeeded');
+          const eventOpens = opened.filter((entry) => entry.turnId === event);
+          assert.ok(eventOpens.some((entry) => entry.helper));
+          assert.ok(eventOpens.every((entry) => entry.model === 'gpt-6-luna'));
+
+          const created = await request('POST', '/api/schedules', {
+            title: 'Synthetic routed schedule',
+            prompt: 'Return the synthetic routed summary.',
+            kind: 'once',
+            runAt: '2099-01-01T09:00:00Z',
+            timeZone: 'UTC',
+          });
+          assert.equal(created.statusCode, 200, created.body);
+          const schedule = created.json();
+          const run = async () => {
+            const revision = (await request('GET', '/api/schedules'))
+              .json()
+              .find((item: { id: string }) => item.id === schedule.id).revision;
+            const response = await request('POST', `/api/schedules/${schedule.id}/run`, {
+              requestId: randomUUID(),
+              expectedRevision: revision,
+            });
+            assert.equal(response.statusCode, 200, response.body);
+            await waitFor(response.json().turnId, 'succeeded');
+            return response.json().turnId as string;
+          };
+          assert.deepEqual(modelsOf(await run()), ['gpt-6.1-sol']);
+          const lightChoice = models.view().light!;
+          const retired = await put(`/api/schedules/${schedule.id}/model`, {
+            model: { ...lightChoice, modelId: 'gpt-retired' },
+          });
+          assert.equal(retired.statusCode, 400, retired.body);
+          assert.match(retired.json<{ error: string }>().error, /available text model/);
+          const pinned = await put(`/api/schedules/${schedule.id}/model`, { model: lightChoice });
+          assert.equal(pinned.statusCode, 200, pinned.body);
+          const second = await run();
+          assert.deepEqual(modelsOf(second), ['gpt-6-luna']);
+
+          const before30 = (await request('GET', '/api/usage/work')).json<WorkUsageResponse>();
+          for (const [turnId, model, input] of [
+            [direct.json().turnId, 'gpt-6.1-sol', 1000],
+            [event, 'gpt-6-luna', 2000],
+            [second, 'gpt-6-luna', 4000],
+            [taskTurn.id, 'gpt-6-luna', 8000],
+          ] as const)
+            await pool.query(
+              'INSERT INTO model_usage(id,owner_id,turn_id,cost_usd,details) VALUES($1,$2,$3,$4,$5)',
+              [
+                randomUUID(),
+                ownerId,
+                turnId,
+                input / 1e6,
+                { category: 'agent', model, inputTokens: input, outputTokens: 0 },
+              ],
+            );
+          const after30 = (await request('GET', '/api/usage/work')).json<WorkUsageResponse>();
+          const grew = (now?: { input: number }, then?: { input: number }) =>
+            (now?.input ?? 0) - (then?.input ?? 0);
+          assert.equal(grew(after30.lanes.chat, before30.lanes.chat), 1000);
+          assert.equal(grew(after30.lanes.background, before30.lanes.background), 2000);
+          assert.equal(grew(after30.lanes.schedule, before30.lanes.schedule), 0);
+          assert.equal(grew(after30.schedules[schedule.id], before30.schedules[schedule.id]), 4000);
+          assert.equal(grew(after30.tasks[task.id], before30.tasks[task.id]), 8000);
+          const onLuna = (usage: WorkUsageResponse, kind: string) =>
+            usage.own
+              .filter(
+                (entry) =>
+                  entry.kind === kind && (entry.task ?? entry.schedule)?.modelId === 'gpt-6-luna',
+              )
+              .reduce((sum, entry) => sum + entry.input, 0);
+          assert.equal(onLuna(after30, 'schedule') - onLuna(before30, 'schedule'), 4000);
+          assert.equal(onLuna(after30, 'chat') - onLuna(before30, 'chat'), 8000);
+
+          const followUp = randomUUID();
+          const followTurn = randomUUID();
+          await pool.query(
+            `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,prompt,status,background)
+             SELECT $1,owner_id,thread_id,$2,id,'task','Synthetic schedule follow-up','succeeded',true FROM turns WHERE id=$3`,
+            [followTurn, followUp, second],
+          );
+          await pool.query(
+            `INSERT INTO tasks(id,owner_id,turn_id,title,done_when,now_text,session_id)
+             VALUES($1,$2,$3,'Synthetic schedule follow-up','Synthetic follow-up is done.','Waiting.',$1)`,
+            [followUp, ownerId, followTurn],
+          );
+          await pool.query(
+            'INSERT INTO model_usage(id,owner_id,turn_id,cost_usd,details) VALUES($1,$2,$3,$4,$5)',
+            [
+              randomUUID(),
+              ownerId,
+              followTurn,
+              0.01,
+              { category: 'agent', model: 'gpt-6.1-sol', inputTokens: 1000, outputTokens: 0 },
+            ],
+          );
+          const inherited = (await request('GET', '/api/tasks'))
+            .json<Task[]>()
+            .find((item) => item.id === followUp)!;
+          assert.equal(inherited.work, 'schedule');
+          assert.equal(inherited.scheduleModel?.modelId, 'gpt-6-luna');
+          const lunaPrice = models
+            .view()
+            .connections[0]!.models.find((item) => item.id === 'gpt-6-luna')!.pricing as {
+            input: number;
+          };
+          const followDefault = (await application.personal.manage('model_select', {
+            scope: 'task',
+            id: followUp,
+            use: 'same',
+          })) as { last30Days?: { withChoiceUsd: number | null } };
+          assert.equal(followDefault.last30Days?.withChoiceUsd, (1000 * lunaPrice.input) / 1e6);
+          await pool.query('DELETE FROM tasks WHERE id=$1', [followUp]);
+
+          const back = await put(`/api/tasks/${task.id}/model`, { model: null });
+          assert.equal(back.statusCode, 200, back.body);
+          assert.equal(back.json<Task>().model, null);
+          assert.equal(
+            (await put(`/api/tasks/${randomUUID()}/model`, { model: null })).statusCode,
+            404,
+          );
+          await request('POST', `/api/tasks/${task.id}/stop`);
+          await pool.query('UPDATE turns SET task_id=NULL WHERE task_id=$1', [task.id]);
+          await pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+          await request('DELETE', `/api/schedules/${schedule.id}`);
+          const reset = await put('/api/models/routes', { lane: 'background', route: null });
+          assert.equal(reset.statusCode, 200, reset.body);
           await assert.rejects(
             application.personal.manage('model_select', {
               ...input,
@@ -1035,6 +1279,78 @@ test(
             dialogOpen = false;
           }
           assert.equal(browserActs.filter((act) => act.action === 'accept_dialog').length, 1);
+        },
+      );
+
+      await t.test(
+        'connection service waits stop automatic app reads and preserve owner reads',
+        async () => {
+          const schedule = await reminder({ prompt: 'Synthetic automatic parent' });
+          connectionWait = { until: Date.now() + 120_000, status: 429, code: 'installation_busy' };
+          appResult = { id: 'synthetic-draft', message: { id: 'synthetic-message' } };
+          const calls = [
+            { action: 'SEARCH_TOOLS', args: { query: 'gmail' } },
+            { action: 'GMAIL_GET_DRAFT', args: { draft_id: 'synthetic-draft' } },
+          ];
+          try {
+            for (const source of ['event', 'schedule'] as const) {
+              let parent: string;
+              if (source === 'schedule') {
+                const response = await request('POST', `/api/schedules/${schedule.id}/run`, {
+                  requestId: randomUUID(),
+                  expectedRevision: 0,
+                });
+                assert.equal(response.statusCode, 200, response.body);
+                parent = response.json().turnId;
+              } else {
+                parent = await enqueueTurn('Synthetic automatic parent', {
+                  source,
+                  background: true,
+                });
+              }
+              await waitFor(parent, 'succeeded');
+              for (const call of calls) {
+                const before = appSessions;
+                const prompt = `Synthetic automatic app read ${randomUUID()}`;
+                plans.set(prompt, { tool: 'apps', ...call });
+                const turn = await enqueueTurn(prompt, {
+                  source: 'task',
+                  parentTurnId: parent,
+                  background: true,
+                });
+                await waitFor(turn, 'succeeded|failed');
+                const saved = (await pool.query('SELECT error FROM turns WHERE id=$1', [turn]))
+                  .rows[0];
+                assert.match(
+                  JSON.stringify(results.get(turn)) ?? saved.error,
+                  /installation_busy.*HTTP 429/,
+                );
+                assert.equal(appSessions, before);
+                assert.deepEqual(await approvalsFor(turn), []);
+              }
+            }
+            for (const call of calls) {
+              const before = appSessions;
+              const owner = await propose(call.action, call.args, 'apps');
+              assert.equal(appSessions, before + 1);
+              assert.deepEqual(await approvalsFor(owner), []);
+              if (call.action === 'GMAIL_GET_DRAFT') {
+                const prompt = `Synthetic owner task read ${randomUUID()}`;
+                plans.set(prompt, { tool: 'apps', ...call });
+                const task = await enqueueTurn(prompt, {
+                  source: 'task',
+                  parentTurnId: owner,
+                  background: true,
+                });
+                await waitFor(task, 'succeeded');
+                assert.equal(appSessions, before + 2);
+              }
+            }
+          } finally {
+            connectionWait = undefined;
+            appResult = undefined;
+            await request('DELETE', `/api/schedules/${schedule.id}`);
+          }
         },
       );
 
@@ -1960,12 +2276,20 @@ test(
             await waitFor(confirmed.json().turnId, 'succeeded');
             assert.equal((await approvalsFor(fresh))[0].status, 'completed');
             const applied = (
-              await pool.query('SELECT revision,title,enabled FROM schedules WHERE id=$1', [
-                schedule.id,
-              ])
+              await pool.query(
+                'SELECT revision,title,enabled,authority FROM schedules WHERE id=$1',
+                [schedule.id],
+              )
             ).rows[0];
             assert.equal(applied.revision, saved.revision + 1);
             assert.equal(applied.enabled, action !== 'schedule_pause');
+            assert.deepEqual(applied.authority.approvals ?? [], saved.authority.approvals ?? []);
+            assert.equal(applied.authority.messages.at(-1).approvalId, reviewed.id);
+            assert.deepEqual(
+              applied.authority.messages.at(-1).fields,
+              action === 'schedule_pause' ? { enabled: false } : { title: args.title },
+            );
+
             assert.equal(applied.title, args.title ?? saved.title);
             if (action === 'schedule_pause') {
               const listed = (await request('GET', '/api/schedules'))
@@ -2042,6 +2366,78 @@ test(
       });
 
       await t.test(
+        'unavailable schedule evidence fails before the model and posts the named failure',
+        async () => {
+          const title = 'Synthetic unavailable schedule';
+          const schedule = await reminder({ title });
+          const threadId = (await request('GET', '/api/state')).json().threadId;
+          const sourceTurn = randomUUID();
+          const sourceMessage = randomUUID();
+          const text = 'Read the synthetic board. Never send email.';
+          await pool.query(
+            "INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,withdrawn) VALUES($1,$2,$3,$3,'user',$4,'succeeded',true)",
+            [sourceTurn, ownerId, threadId, text],
+          );
+          await pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'user',$5)",
+            [sourceMessage, ownerId, threadId, sourceTurn, text],
+          );
+          for (const [authority, reason] of [
+            [null, /no saved owner instruction/],
+            [{ messages: [] }, /no saved owner instruction/],
+            [
+              {
+                messages: [
+                  {
+                    id: null,
+                    at: new Date().toISOString(),
+                    text: 'Background only.',
+                    canAuthorize: false,
+                  },
+                ],
+              },
+              /no saved owner instruction/,
+            ],
+            [{ messages: [], requiresReplacement: true }, /changes without source records/],
+            [
+              { messages: [{ id: sourceMessage, at: new Date().toISOString(), text }] },
+              /withdrawn or unavailable/,
+            ],
+          ] as const) {
+            await pool.query('UPDATE schedules SET authority=$2 WHERE id=$1', [
+              schedule.id,
+              authority === null ? null : JSON.stringify(authority),
+            ]);
+            const response = await request('POST', `/api/schedules/${schedule.id}/run`, {
+              requestId: randomUUID(),
+              expectedRevision: 0,
+            });
+            assert.equal(response.statusCode, 200, response.body);
+            const turnId = response.json().turnId;
+            await waitFor(turnId, 'failed');
+            assert.equal(prompts.has(turnId), false);
+            const failure = (await pool.query('SELECT error FROM turns WHERE id=$1', [turnId]))
+              .rows[0];
+            assert.match(failure.error, reason);
+            let notices: { text: string }[] = [];
+            for (let attempt = 0; attempt < 250 && !notices.length; attempt++) {
+              notices = (
+                await pool.query(
+                  "SELECT text FROM messages WHERE turn_id=$1 AND role='assistant'",
+                  [turnId],
+                )
+              ).rows;
+              if (!notices.length) await delay(20);
+            }
+            assert.equal(notices.length, 1);
+            assert.ok(notices[0].text.includes(title));
+            assert.match(notices[0].text, reason);
+          }
+          await request('DELETE', `/api/schedules/${schedule.id}`);
+        },
+      );
+
+      await t.test(
         'direct schedule pause or deletion retires an outstanding chat confirmation',
         async () => {
           for (const method of ['PATCH', 'DELETE'] as const) {
@@ -2061,8 +2457,8 @@ test(
                 client,
               });
               await client.query(
-                `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority_instruction)
-                 VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',$8)`,
+                `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority)
+                 VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',jsonb_build_object('messages',jsonb_build_array(jsonb_build_object('id',null,'at',now(),'text',$8::text))))`,
                 [
                   randomUUID(),
                   ownerId,
@@ -2402,8 +2798,8 @@ test(
               client,
             });
             await client.query(
-              `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority_instruction)
-             VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',$8)`,
+              `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority)
+             VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',jsonb_build_object('messages',jsonb_build_array(jsonb_build_object('id',null,'at',now(),'text',$8::text))))`,
               [
                 randomUUID(),
                 ownerId,
@@ -3270,11 +3666,45 @@ test(
               (await pool.query('SELECT error FROM turns WHERE id=$1', [task])).rows[0].error,
             /work the owner started/,
           );
-          const listText = `List the synthetic folder ${randomUUID()}`;
-          asked.add(listText);
-          const listed = await propose('list', { path: folder }, 'files', listText);
-          assert.deepEqual(await approvalsFor(listed), []);
-          assert.match(text(listed), /contract\.txt/);
+          const readText = `Summarize contract.txt ${randomUUID()}`;
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, false);
+          const opening = await propose(
+            'read',
+            { path: join(folder, 'contract.txt') },
+            'files',
+            readText,
+          );
+          const [access] = await approvalsFor(opening);
+          assert.equal(access.action, 'NOD_notification_preferences_update');
+          assert.deepEqual(access.args, { localFilesEnabled: true });
+          assert.doesNotMatch(text(opening), /Synthetic contract/);
+          asked.add(readText);
+          repeatAfterConfirm = {
+            tool: 'files',
+            action: 'read',
+            args: { path: join(folder, 'contract.txt') },
+          };
+          const accepted = await request('POST', '/api/messages', {
+            text: 'Yes',
+            replyToMessageId: access.confirmation_message_id,
+            approvalAnswer: { approvalId: access.id, approved: true },
+          });
+          assert.equal(accepted.statusCode, 200, accepted.body);
+          await waitFor(accepted.json().turnId, 'succeeded');
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, true);
+          assert.match(text(accepted.json().turnId), /Synthetic contract/);
+          await request('PATCH', '/api/preferences', { localFilesEnabled: false });
+          const enableText = `Enable local file access and read contract.txt ${randomUUID()}`;
+          asked.add(enableText);
+          plans.set(enableText, {
+            tool: 'files',
+            action: 'read',
+            args: { path: join(folder, 'contract.txt') },
+          });
+          const enabled = await submitUserMessage(enableText);
+          await waitFor(enabled.turnId, 'succeeded');
+          assert.deepEqual(await approvalsFor(enabled.turnId), []);
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, true);
           const unnamed = await propose(
             'read',
             { path: `${folder}/sorted/../contract.txt` },
@@ -3284,16 +3714,6 @@ test(
           assert.equal(held.status, 'pending');
           assert.equal(held.action, 'LOCAL_FILES_READ');
           assert.deepEqual(held.args, { path: join(folder, 'contract.txt') });
-          const readText = `Summarize contract.txt ${randomUUID()}`;
-          asked.add(readText);
-          const opened = await propose(
-            'read',
-            { path: join(folder, 'contract.txt') },
-            'files',
-            readText,
-          );
-          assert.deepEqual(await approvalsFor(opened), []);
-          assert.match(text(opened), /Synthetic contract/);
           const schedule = await reminder();
           const scheduledPrompt = `Synthetic scheduled listing ${randomUUID()}`;
           plans.set(scheduledPrompt, { tool: 'files', action: 'list', args: { path: folder } });
@@ -3305,8 +3725,8 @@ test(
               client,
             });
             await client.query(
-              `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority_instruction)
-               VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',$8)`,
+              `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority)
+               VALUES($1,$2,$3,0,$4,$5,$6,$7,'UTC',jsonb_build_object('messages',jsonb_build_array(jsonb_build_object('id',null,'at',now(),'text',$8::text))))`,
               [
                 randomUUID(),
                 ownerId,
